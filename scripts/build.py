@@ -421,107 +421,31 @@ def chart_roses(speed_ts, dir_ts, station_info):
     return fig_to_b64(fig)
 
 
-# ── Map: SVG bubble map of Singapore ─────────────────────────────────────────
+# ── Map: pannable Leaflet map of Singapore ───────────────────────────────────
 
-def make_map(speed_ts, dir_ts, station_info):
+def build_map_data(speed_ts, dir_ts, station_info):
     """
-    Render a simple SVG map of Singapore with station bubbles.
-    Bubble size = mean speed, colour = mean speed (YlOrRd),
-    arrow = mean wind direction.
+    Build the per-station records the Leaflet map renders client-side.
+    Bubble size/colour = mean speed, arrow = mean wind direction (where FROM).
     """
-    # Singapore bounding box (approximate)
-    LAT_MIN, LAT_MAX = 1.22,  1.47
-    LON_MIN, LON_MAX = 103.60, 104.00
-
-    W, H = 700, 500
-    PAD  = 50
-
-    def proj(lat, lon):
-        x = PAD + (lon - LON_MIN) / (LON_MAX - LON_MIN) * (W - 2*PAD)
-        y = H - PAD - (lat - LAT_MIN) / (LAT_MAX - LAT_MIN) * (H - 2*PAD)
-        return x, y
-
     rows = []
     for sid, spd_raw in speed_ts.items():
         info = station_info.get(sid)
         if not info or info["lat"] == 0: continue
-        spd  = ms_to_kmh(spd_raw)
+        spd = ms_to_kmh(spd_raw)
+        valid_spd = spd[~np.isnan(spd)]
+        if len(valid_spd) == 0: continue
         dirs = np.array(dir_ts.get(sid, []), dtype=float)
-        mean_spd = float(np.nanmean(spd))
         mean_dir = mean_direction(dirs)
         rows.append({
-            "sid": sid, "name": info["name"],
-            "lat": info["lat"], "lon": info["lon"],
-            "mean_spd": mean_spd, "mean_dir": mean_dir,
+            "sid":      sid,
+            "name":     info["name"],
+            "lat":      info["lat"],
+            "lon":      info["lon"],
+            "mean_spd": round(float(np.nanmean(spd)), 2),
+            "mean_dir": None if np.isnan(mean_dir) else round(float(mean_dir), 1),
         })
-
-    if not rows: return ""
-
-    max_spd = max(r["mean_spd"] for r in rows) or 1
-    R_MAX   = 28
-    R_MIN   = 6
-
-    def speed_to_color(spd):
-        t = spd / max_spd
-        # interpolate #ffffa0 → #ff4500
-        r = int(255)
-        g = int(255 * (1 - t) * 0.7 + 69 * t)
-        b = int(160 * (1 - t))
-        return f"#{r:02x}{g:02x}{b:02x}"
-
-    circles = []
-    arrows  = []
-    labels  = []
-
-    for r in rows:
-        cx, cy = proj(r["lat"], r["lon"])
-        radius = R_MIN + (r["mean_spd"] / max_spd) * (R_MAX - R_MIN)
-        col    = speed_to_color(r["mean_spd"])
-        tip    = (f"{r['name']} ({r['sid']})\n"
-                  f"Mean: {r['mean_spd']:.1f} km/h\n"
-                  f"Dir: {r['mean_dir']:.0f}°" if not np.isnan(r["mean_dir"]) else "")
-
-        circles.append(
-            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{radius:.1f}" '
-            f'fill="{col}" fill-opacity="0.82" stroke="#fff" stroke-width="1">'
-            f'<title>{tip}</title></circle>'
-        )
-
-        if not np.isnan(r["mean_dir"]):
-            dx, dy = bearing_arrow(r["mean_dir"])
-            scale  = radius * 1.5
-            x2, y2 = cx + dx * scale, cy + dy * scale
-            arrows.append(
-                f'<line x1="{cx:.1f}" y1="{cy:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
-                f'stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>'
-            )
-
-        labels.append(
-            f'<text x="{cx:.1f}" y="{cy + radius + 10:.1f}" '
-            f'text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">'
-            f'{r["sid"]}</text>'
-        )
-
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}"
-  style="background:#161b22;border-radius:8px">
-  <defs>
-    <marker id="arr" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
-      <path d="M0,0 L6,3 L0,6 Z" fill="#58a6ff"/>
-    </marker>
-  </defs>
-  <!-- Singapore rough outline hint -->
-  <text x="{W//2}" y="22" text-anchor="middle" font-size="11"
-    fill="#8b949e">Singapore — Mean Wind Speed &amp; Direction</text>
-  {"".join(circles)}
-  {"".join(arrows)}
-  {"".join(labels)}
-  <!-- Legend -->
-  <circle cx="60" cy="{H-30}" r="{R_MIN:.0f}" fill="#ffff80" stroke="#fff" stroke-width="1"/>
-  <text x="75" y="{H-26}" font-size="8" fill="#8b949e">low speed</text>
-  <circle cx="60" cy="{H-14}" r="{R_MAX:.0f}" fill="#ff4500" stroke="#fff" stroke-width="1"/>
-  <text x="75" y="{H-10}" font-size="8" fill="#8b949e">high speed</text>
-</svg>"""
-    return svg
+    return rows
 
 
 # ── Summary table ─────────────────────────────────────────────────────────────
@@ -567,6 +491,7 @@ HTML = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SG Wind Report — {date} {h_start}h–{h_end}h SGT</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{background:#0d1117;color:#e6edf3;font-family:'Courier New',monospace;
@@ -588,8 +513,17 @@ HTML = """\
                border-radius:8px;overflow:hidden;padding:8px}}
   .chart-wrap img{{width:100%;height:auto;display:block}}
   .map-wrap{{background:#161b22;border:1px solid #30363d;
-             border-radius:8px;overflow:hidden;padding:8px;
-             display:flex;justify-content:center}}
+             border-radius:8px;overflow:hidden}}
+  #leaflet-map{{height:520px;width:100%;background:#0d1117}}
+  .wind-arrow{{color:#58a6ff;font-size:18px;line-height:20px;text-align:center;
+               text-shadow:0 0 3px #000;pointer-events:none}}
+  .leaflet-popup-content-wrapper{{background:#161b22;color:#e6edf3;
+               border:1px solid #30363d;font-family:'Courier New',monospace}}
+  .leaflet-popup-tip{{background:#161b22}}
+  .leaflet-container a.leaflet-popup-close-button{{color:#8b949e}}
+  .leaflet-control-zoom a{{background:#161b22;color:#e6edf3;border-color:#30363d}}
+  .leaflet-control-attribution{{background:rgba(22,27,34,.8);color:#8b949e}}
+  .leaflet-control-attribution a{{color:#58a6ff}}
   table{{width:100%;border-collapse:collapse;font-size:.82rem}}
   th{{background:#1f2937;color:#8b949e;padding:8px 12px;
       text-align:left;font-weight:600;position:sticky;top:72px}}
@@ -621,9 +555,10 @@ HTML = """\
 <section id="map">
   <h2>Geographic Overview</h2>
   <p style="color:#8b949e;font-size:.82rem;margin-bottom:12px">
-    Bubble size and colour = mean wind speed. Arrow = mean wind direction (where FROM).
+    Drag to pan, scroll or use the +/- controls to zoom. Circle size and colour = mean
+    wind speed. Arrow = mean wind direction (where FROM).
   </p>
-  <div class="map-wrap">{svg_map}</div>
+  <div class="map-wrap"><div id="leaflet-map"></div></div>
 </section>
 
 <section id="timeseries">
@@ -677,6 +612,62 @@ HTML = """\
   Generated by GitHub Actions · Source: NEA / data.gov.sg (Open Data Licence) ·
   Report date: {date} · Built {built}
 </footer>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function() {{
+  var stations = {map_data};
+  var map = L.map('leaflet-map', {{
+    center: [1.3521, 103.8198],
+    zoom: 11,
+    minZoom: 10,
+    maxZoom: 17,
+    scrollWheelZoom: true
+  }});
+
+  L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    subdomains: 'abcd',
+    maxZoom: 19
+  }}).addTo(map);
+
+  var maxSpd = 1;
+  stations.forEach(function(s) {{ if (s.mean_spd > maxSpd) maxSpd = s.mean_spd; }});
+
+  function speedColor(spd) {{
+    var t = spd / maxSpd;
+    var r = 255;
+    var g = Math.round(255 * (1 - t) * 0.7 + 69 * t);
+    var b = Math.round(160 * (1 - t));
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }}
+
+  stations.forEach(function(s) {{
+    var radius = 6 + (s.mean_spd / maxSpd) * 16;
+    L.circleMarker([s.lat, s.lon], {{
+      radius: radius,
+      fillColor: speedColor(s.mean_spd),
+      color: '#fff',
+      weight: 1,
+      fillOpacity: 0.85
+    }}).addTo(map).bindPopup(
+      '<b>' + s.name + '</b> (' + s.sid + ')<br>' +
+      'Mean: ' + s.mean_spd.toFixed(1) + ' km/h' +
+      (s.mean_dir !== null ? '<br>Dir: ' + Math.round(s.mean_dir) + '&deg;' : '')
+    );
+
+    if (s.mean_dir !== null) {{
+      var rot = s.mean_dir - 90;
+      var icon = L.divIcon({{
+        className: 'wind-arrow',
+        html: '<div style="transform:rotate(' + rot + 'deg)">&#10148;</div>',
+        iconSize: [20, 20],
+        iconAnchor: [10, 10]
+      }});
+      L.marker([s.lat, s.lon], {{icon: icon, interactive: false}}).addTo(map);
+    }}
+  }});
+}})();
+</script>
 </body>
 </html>
 """
@@ -701,7 +692,8 @@ def main():
     img_heat = chart_heatmap(timestamps, speed_ts, station_info)
     img_rank = chart_ranking(speed_ts, dir_ts, station_info)
     img_rose = chart_roses(speed_ts, dir_ts, station_info)
-    svg_map  = make_map(speed_ts, dir_ts, station_info)
+    map_stations = build_map_data(speed_ts, dir_ts, station_info)
+    map_data = json.dumps(map_stations).replace("</", "<\\/")
     tbl_rows = build_table(speed_ts, dir_ts, station_info)
 
     html = HTML.format(
@@ -710,7 +702,7 @@ def main():
         h_end      = HOUR_END,
         n_stations = n_stations,
         n_minutes  = n_minutes,
-        svg_map    = svg_map,
+        map_data   = map_data,
         img_spag   = img_spag,
         img_heat   = img_heat,
         img_rank   = img_rank,
