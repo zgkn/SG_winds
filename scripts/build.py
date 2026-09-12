@@ -112,11 +112,12 @@ def extract(payload):
                     "lat":  float(loc.get("latitude",  0)),
                     "lon":  float(loc.get("longitude", 0)),
                 }
-        for item in data.get("readings", []):
-            sid = item.get("stationId") or item.get("station_id")
-            val = item.get("value")
-            if sid and val is not None:
-                readings[sid] = float(val)
+        for block in data.get("readings", []):
+            for item in block.get("data", []):
+                sid = item.get("stationId") or item.get("station_id")
+                val = item.get("value")
+                if sid and val is not None:
+                    readings[sid] = float(val)
     except (KeyError, TypeError):
         pass
     return readings, meta
@@ -258,7 +259,7 @@ def bearing_arrow(deg):
 
 def chart_spaghetti(timestamps, speed_ts):
     sids = sorted(speed_ts)
-    cmap = plt.cm.get_cmap("tab20", len(sids))
+    cmap = matplotlib.colormaps["tab20"].resampled(len(sids))
     t_arr = np.array(timestamps)
 
     fig, ax = plt.subplots(figsize=(14, 5))
@@ -342,7 +343,7 @@ def chart_ranking(speed_ts, dir_ts, station_info):
     y     = range(len(rows))
     means = [r["mean"] for r in rows]
     maxes = [r["max"]  for r in rows]
-    cmap  = plt.cm.get_cmap("YlOrRd")
+    cmap  = matplotlib.colormaps["YlOrRd"]
     norm  = Normalize(vmin=0, vmax=max(maxes) if maxes else 1)
 
     ax.barh(list(y), maxes,  color=[cmap(norm(m)*0.5+0.15) for m in maxes],
@@ -406,7 +407,7 @@ def chart_roses(speed_ts, dir_ts, station_info):
 
             theta   = np.radians((bin_edges[:-1] + bin_edges[1:]) / 2)
             width   = np.radians(18)
-            cmap    = plt.cm.get_cmap("YlOrRd")
+            cmap    = matplotlib.colormaps["YlOrRd"]
             max_spd = max(bin_spd) if max(bin_spd) > 0 else 1
             colors  = [cmap(s / max_spd) for s in bin_spd]
             ax.bar(theta, counts, width=width, color=colors, alpha=0.85, align="center")
