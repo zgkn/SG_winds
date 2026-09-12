@@ -337,59 +337,55 @@ def region_of(lat, lon):
     return "East" if dlon > 0 else "West"
 
 
-# ── Chart 1: Spaghetti speed time series (all stations) ──────────────────────
+# ── Chart 1: Speed time series, one small-multiple panel per region ──────────
 
 def chart_spaghetti(timestamps, speed_ts, station_info):
-    sids = sorted(speed_ts)
-    cmap = matplotlib.colormaps["tab20"].resampled(len(sids))
     t_arr = np.array(timestamps)
 
-    fig, ax = plt.subplots(figsize=(16, 5))
-    fig.patch.set_facecolor(BG)
-
-    lines_by_region = {r: [] for r in REGION_ORDER}
-    for i, sid in enumerate(sids):
-        spd = ms_to_kmh(speed_ts[sid])
+    sids_by_region = {r: [] for r in REGION_ORDER}
+    for sid in sorted(speed_ts):
         info = station_info.get(sid, {})
-        name = info.get("name", sid)
         lat = info.get("lat") or SG_CENTER_LAT
         lon = info.get("lon") or SG_CENTER_LON
-        region = region_of(lat, lon)
-        line, = ax.plot(t_arr, spd, color=cmap(i), lw=1.2, alpha=0.8,
-                         label=shorten_name(name))
-        lines_by_region[region].append(line)
+        sids_by_region[region_of(lat, lon)].append(sid)
 
-    ax.set_title(f"Wind Speed — All Stations  |  {PERIOD_LABEL}",
-                 fontsize=11, pad=8)
-    ax.set_ylabel("km/h")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    ax.xaxis.set_major_locator(mdates.MinuteLocator(byminute=range(0, 60, 5)))
-    ax.tick_params(axis="x", rotation=45, labelsize=8)
-    ax.grid(True, ls="--", alpha=0.4)
-    ax.set_xlabel("Time (SGT)")
+    active_regions = [r for r in REGION_ORDER if sids_by_region[r]]
+    n = max(len(active_regions), 1)
+    ncols = min(3, n)
+    nrows = math.ceil(n / ncols)
 
-    # One small titled legend per region, stacked outside the plot — this
-    # groups stations by region without relying on matplotlib's fragile
-    # (and version-dependent) multi-column legend fill order.
-    active_regions = [r for r in REGION_ORDER if lines_by_region[r]]
-    region_legends = []
-    if active_regions:
-        top = 1.0
-        step = 1.0 / len(active_regions)
-        for i, region in enumerate(active_regions):
-            lines = lines_by_region[region]
-            leg = ax.legend(
-                handles=lines, labels=[l.get_label() for l in lines],
-                title=region, fontsize=6, title_fontsize=7,
-                loc="upper left", bbox_to_anchor=(1.01, top - i * step),
-                framealpha=0.85, handlelength=1.2, borderaxespad=0,
-            )
-            leg.get_title().set_fontweight("bold")
-            region_legends.append(leg)
-        for leg in region_legends[:-1]:
-            ax.add_artist(leg)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.6 * ncols, 3.8 * nrows),
+                              sharex=True, sharey=True, squeeze=False)
+    fig.patch.set_facecolor(BG)
+    axes_flat = axes.flatten()
 
-    return fig_to_b64(fig, extra_artists=region_legends)
+    for idx, region in enumerate(active_regions):
+        ax = axes_flat[idx]
+        sids = sids_by_region[region]
+        cmap = matplotlib.colormaps["tab10"].resampled(len(sids))
+        for i, sid in enumerate(sids):
+            spd = ms_to_kmh(speed_ts[sid])
+            name = station_info.get(sid, {}).get("name", sid)
+            ax.plot(t_arr, spd, color=cmap(i), lw=1.3, alpha=0.85,
+                    label=shorten_name(name))
+
+        ax.set_title(region, fontsize=10, fontweight="bold")
+        locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ax.tick_params(axis="x", rotation=45, labelsize=7)
+        ax.grid(True, ls="--", alpha=0.4)
+        ax.legend(fontsize=6.5, loc="upper right", framealpha=0.8, handlelength=1.2)
+
+    # Hide any unused trailing cells (grid may have more slots than regions).
+    for j in range(len(active_regions), len(axes_flat)):
+        axes_flat[j].axis("off")
+
+    fig.supxlabel("Time (SGT)", fontsize=9)
+    fig.supylabel("km/h", fontsize=9)
+    fig.suptitle(f"Wind Speed by Region  |  {PERIOD_LABEL}", fontsize=12)
+    fig.tight_layout(rect=[0.01, 0.01, 1, 0.94])
+    return fig_to_b64(fig)
 
 
 # ── Chart 2: Station ranking (mean speed + direction arrow) ──────────────────
@@ -703,7 +699,7 @@ HTML = """\
 </section>
 
 <section id="timeseries">
-  <h2>Speed Time Series — All Stations</h2>
+  <h2>Speed Time Series — By Region</h2>
   <div class="chart-wrap"><img src="data:image/png;base64,{img_spag}" alt="time series"></div>
 </section>
 
