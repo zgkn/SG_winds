@@ -108,7 +108,7 @@ def extract(payload):
     Return ({stationId: value}, station_metadata, reading_unit) from one
     API response. reading_unit is whatever the API itself reports (e.g.
     "knots" or "m/s") via data.readingUnit, or None if absent — used to
-    verify the assumption baked into ms_to_kmh() rather than trusting it
+    verify the assumption baked into speed_to_kmh() rather than trusting it
     blindly.
     """
     readings = {}
@@ -151,10 +151,10 @@ def collect():
         dir_ts      : dict[stationId -> list[float|nan]]
         station_info: dict[stationId -> {name, lat, lon}]
         units       : dict with "speed"/"direction" -> unit string reported
-                      by the API (or None if it never included one), so the
-                      m/s assumption baked into ms_to_kmh() can be checked
-                      against what NEA actually says rather than trusted
-                      blindly.
+                      by the API (or None if it never included one). Also
+                      updates the module-level SPEED_UNIT_FACTOR to match
+                      what the API actually reports, rather than trusting a
+                      hardcoded assumption.
     """
     minutes = []
     t = START_DT
@@ -230,10 +230,20 @@ def collect():
 
     print(f"  API-reported units — speed: {units['speed'] or 'not provided'}, "
           f"direction: {units['direction'] or 'not provided'}")
-    if units["speed"] and units["speed"].lower() not in ("m/s", "metre per second", "meter per second", "metres per second"):
-        print(f"  ⚠ WARNING: ms_to_kmh() assumes m/s, but the API reports "
-              f"speed in '{units['speed']}' — converted values are likely WRONG. "
-              f"See ms_to_kmh() in build.py.")
+
+    global SPEED_UNIT_FACTOR
+    key = (units["speed"] or "").strip().lower()
+    if key in SPEED_UNIT_TO_KMH:
+        SPEED_UNIT_FACTOR = SPEED_UNIT_TO_KMH[key]
+    elif units["speed"]:
+        print(f"  ⚠ WARNING: unrecognized speed unit '{units['speed']}' from the "
+              f"API — falling back to knots (x1.852). Add it to SPEED_UNIT_TO_KMH "
+              f"in build.py if this is wrong.")
+        SPEED_UNIT_FACTOR = SPEED_UNIT_TO_KMH["knots"]
+    else:
+        print(f"  ⚠ WARNING: API did not report a speed unit — assuming knots "
+              f"(x1.852), NEA's confirmed unit as of 2026-09-12.")
+    print(f"  Using speed conversion factor: x{SPEED_UNIT_FACTOR} -> km/h")
 
     return timestamps, speed_ts, dir_ts, station_info, units
 
@@ -273,8 +283,23 @@ def fig_to_b64(fig, extra_artists=None):
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def ms_to_kmh(v):
-    return np.array(v, dtype=float) * 3.6
+# Confirmed live (2026-09-12): NEA's real-time wind-speed API reports in
+# knots, not m/s — this default matches that. collect() overrides it once
+# it has actually read the API's own readingUnit field for this run, so a
+# future change in what NEA reports doesn't silently produce wrong numbers.
+SPEED_UNIT_TO_KMH = {
+    "knot": 1.852, "knots": 1.852, "kt": 1.852, "kts": 1.852,
+    "m/s": 3.6, "mps": 3.6, "meter per second": 3.6, "meters per second": 3.6,
+    "metre per second": 3.6, "metres per second": 3.6,
+    "km/h": 1.0, "kmh": 1.0, "kph": 1.0,
+    "kilometer per hour": 1.0, "kilometre per hour": 1.0,
+}
+SPEED_UNIT_FACTOR = SPEED_UNIT_TO_KMH["knots"]
+
+
+def speed_to_kmh(v):
+    """Convert a raw NEA speed reading to km/h using SPEED_UNIT_FACTOR."""
+    return np.array(v, dtype=float) * SPEED_UNIT_FACTOR
 
 
 def mean_uv(speed, direction):
@@ -389,7 +414,7 @@ def chart_spaghetti(timestamps, speed_ts, station_info):
         sids = sids_by_region[region]
         cmap = matplotlib.colormaps["tab10"].resampled(len(sids))
         for i, sid in enumerate(sids):
-            spd = ms_to_kmh(speed_ts[sid])
+            spd = speed_to_kmh(speed_ts[sid])
             name = station_info.get(sid, {}).get("name", sid)
             ax.plot(t_arr, spd, color=cmap(i), lw=1.3, alpha=0.85,
                     label=shorten_name(name))
@@ -418,7 +443,7 @@ def chart_spaghetti(timestamps, speed_ts, station_info):
 def chart_ranking(speed_ts, dir_ts, station_info):
     rows = []
     for sid, spd_raw in speed_ts.items():
-        spd = ms_to_kmh(spd_raw)
+        spd = speed_to_kmh(spd_raw)
         valid_spd = spd[~np.isnan(spd)]
         if len(valid_spd) == 0: continue
         dirs = np.array(dir_ts.get(sid, []), dtype=float)
@@ -477,7 +502,7 @@ def build_map_data(speed_ts, dir_ts, station_info):
     for sid, spd_raw in speed_ts.items():
         info = station_info.get(sid)
         if not info or info["lat"] == 0: continue
-        spd = ms_to_kmh(spd_raw)
+        spd = speed_to_kmh(spd_raw)
         valid_spd = spd[~np.isnan(spd)]
         if len(valid_spd) == 0: continue
         dirs = np.array(dir_ts.get(sid, []), dtype=float)
@@ -521,7 +546,7 @@ def build_convergence_field(speed_ts, dir_ts, station_info, grid_n=CONV_GRID_N):
     for sid, spd_raw in speed_ts.items():
         info = station_info.get(sid)
         if not info or info["lat"] == 0: continue
-        spd = ms_to_kmh(spd_raw)
+        spd = speed_to_kmh(spd_raw)
         dirs = np.array(dir_ts.get(sid, []), dtype=float)
         u, v = mean_uv(spd, dirs)
         if np.isnan(u): continue
@@ -605,7 +630,7 @@ def render_convergence_overlay(convergence):
 def build_table(speed_ts, dir_ts, station_info):
     rows = []
     for sid, spd_raw in speed_ts.items():
-        spd  = ms_to_kmh(spd_raw)
+        spd  = speed_to_kmh(spd_raw)
         dirs = np.array(dir_ts.get(sid, []), dtype=float)
         vs   = spd[~np.isnan(spd)]
         if len(vs) == 0: continue
