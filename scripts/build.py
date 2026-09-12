@@ -4,10 +4,9 @@ build.py — Fetch NEA wind data for all stations and render a static website.
 Outputs to ./docs/  (served by GitHub Pages).
 
 Environment variables (set by Actions):
-  REPORT_DATE   YYYY-MM-DD (SGT)
-  HOUR_START    integer 0-23
-  HOUR_END      integer 0-23 (inclusive)
-  NEA_API_KEY   optional — doubles rate limit from 6 → 12 calls/10 s
+  START_DATETIME   YYYY-MM-DDTHH:MM (SGT), inclusive
+  END_DATETIME     YYYY-MM-DDTHH:MM (SGT), inclusive
+  NEA_API_KEY      optional — doubles rate limit from 6 → 12 calls/10 s
 """
 
 import os, sys, re, time, json, math, base64, io
@@ -29,10 +28,20 @@ from matplotlib.colors import Normalize, TwoSlopeNorm
 API_SPEED = "https://api-open.data.gov.sg/v2/real-time/api/wind-speed"
 API_DIR   = "https://api-open.data.gov.sg/v2/real-time/api/wind-direction"
 
-API_KEY    = os.environ.get("NEA_API_KEY", "")
-DATE_STR   = os.environ.get("REPORT_DATE", "2026-09-12")
-HOUR_START = int(os.environ.get("HOUR_START", "8"))
-HOUR_END   = int(os.environ.get("HOUR_END",   "9"))
+DATETIME_FMT = "%Y-%m-%dT%H:%M"
+
+API_KEY  = os.environ.get("NEA_API_KEY", "")
+START_DT = datetime.strptime(os.environ.get("START_DATETIME", "2026-09-12T08:00"), DATETIME_FMT)
+END_DT   = datetime.strptime(os.environ.get("END_DATETIME",   "2026-09-12T09:00"), DATETIME_FMT)
+
+if END_DT < START_DT:
+    sys.exit(f"END_DATETIME ({END_DT}) is before START_DATETIME ({START_DT})")
+
+# Display strings for chart titles / page header / footer.
+if START_DT.date() == END_DT.date():
+    PERIOD_LABEL = f"{START_DT:%Y-%m-%d}  {START_DT:%H:%M}–{END_DT:%H:%M} SGT"
+else:
+    PERIOD_LABEL = f"{START_DT:%Y-%m-%d %H:%M} – {END_DT:%Y-%m-%d %H:%M} SGT"
 
 # Rate-limit: 6 calls/10 s without key, 12 with key (reset every 10 s)
 CALLS_PER_WINDOW = 12 if API_KEY else 6
@@ -134,13 +143,9 @@ def collect():
         dir_ts      : dict[stationId -> list[float|nan]]
         station_info: dict[stationId -> {name, lat, lon}]
     """
-    date = datetime.strptime(DATE_STR, "%Y-%m-%d")
-    start = date.replace(hour=HOUR_START)
-    # Inclusive end hour → fetch through end_hour:59
-    end   = date.replace(hour=HOUR_END, minute=59)
     minutes = []
-    t = start
-    while t <= end:
+    t = START_DT
+    while t <= END_DT:
         minutes.append(t)
         t += timedelta(minutes=1)
 
@@ -229,9 +234,15 @@ plt.rcParams.update({
 })
 
 
-def fig_to_b64(fig):
+def fig_to_b64(fig, extra_artists=None):
+    """
+    extra_artists: artists (e.g. legends added via ax.add_artist()) that
+    savefig's tight bbox calculation won't discover on its own and would
+    otherwise clip out of the saved image.
+    """
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=130, bbox_inches="tight",
+                bbox_extra_artists=extra_artists,
                 facecolor=fig.get_facecolor())
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode()
@@ -308,6 +319,24 @@ def shorten_name(name, max_len=18):
     return short
 
 
+# Rough geometric region classifier (Singapore has no single station->region
+# lookup that's reliably available from the API), used to group the time
+# series legend. SG_CENTER is close to the geographic centroid of the island.
+SG_CENTER_LAT, SG_CENTER_LON = 1.3521, 103.8198
+SG_CENTRAL_RADIUS_DEG = 0.045
+REGION_ORDER = ["North", "East", "South", "West", "Central"]
+
+
+def region_of(lat, lon):
+    dlat = lat - SG_CENTER_LAT
+    dlon = lon - SG_CENTER_LON
+    if math.hypot(dlat, dlon) < SG_CENTRAL_RADIUS_DEG:
+        return "Central"
+    if abs(dlat) >= abs(dlon):
+        return "North" if dlat > 0 else "South"
+    return "East" if dlon > 0 else "West"
+
+
 # ── Chart 1: Spaghetti speed time series (all stations) ──────────────────────
 
 def chart_spaghetti(timestamps, speed_ts, station_info):
@@ -315,26 +344,52 @@ def chart_spaghetti(timestamps, speed_ts, station_info):
     cmap = matplotlib.colormaps["tab20"].resampled(len(sids))
     t_arr = np.array(timestamps)
 
-    fig, ax = plt.subplots(figsize=(14, 5))
+    fig, ax = plt.subplots(figsize=(16, 5))
     fig.patch.set_facecolor(BG)
 
+    lines_by_region = {r: [] for r in REGION_ORDER}
     for i, sid in enumerate(sids):
         spd = ms_to_kmh(speed_ts[sid])
-        name = station_info.get(sid, {}).get("name", sid)
-        ax.plot(t_arr, spd, color=cmap(i), lw=1.2, alpha=0.8,
-                label=shorten_name(name))
+        info = station_info.get(sid, {})
+        name = info.get("name", sid)
+        lat = info.get("lat") or SG_CENTER_LAT
+        lon = info.get("lon") or SG_CENTER_LON
+        region = region_of(lat, lon)
+        line, = ax.plot(t_arr, spd, color=cmap(i), lw=1.2, alpha=0.8,
+                         label=shorten_name(name))
+        lines_by_region[region].append(line)
 
-    ax.set_title(f"Wind Speed — All Stations  |  {DATE_STR}  {HOUR_START:02d}:00–{HOUR_END:02d}:59 SGT",
+    ax.set_title(f"Wind Speed — All Stations  |  {PERIOD_LABEL}",
                  fontsize=11, pad=8)
     ax.set_ylabel("km/h")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    ax.xaxis.set_major_locator(mdates.MinuteLocator(byminute=range(0, 60*(HOUR_END-HOUR_START+1), 5)))
+    ax.xaxis.set_major_locator(mdates.MinuteLocator(byminute=range(0, 60, 5)))
     ax.tick_params(axis="x", rotation=45, labelsize=8)
-    ax.legend(ncol=3, fontsize=6.5, loc="upper right",
-              framealpha=0.7, handlelength=1.2)
     ax.grid(True, ls="--", alpha=0.4)
     ax.set_xlabel("Time (SGT)")
-    return fig_to_b64(fig)
+
+    # One small titled legend per region, stacked outside the plot — this
+    # groups stations by region without relying on matplotlib's fragile
+    # (and version-dependent) multi-column legend fill order.
+    active_regions = [r for r in REGION_ORDER if lines_by_region[r]]
+    region_legends = []
+    if active_regions:
+        top = 1.0
+        step = 1.0 / len(active_regions)
+        for i, region in enumerate(active_regions):
+            lines = lines_by_region[region]
+            leg = ax.legend(
+                handles=lines, labels=[l.get_label() for l in lines],
+                title=region, fontsize=6, title_fontsize=7,
+                loc="upper left", bbox_to_anchor=(1.01, top - i * step),
+                framealpha=0.85, handlelength=1.2, borderaxespad=0,
+            )
+            leg.get_title().set_fontweight("bold")
+            region_legends.append(leg)
+        for leg in region_legends[:-1]:
+            ax.add_artist(leg)
+
+    return fig_to_b64(fig, extra_artists=region_legends)
 
 
 # ── Chart 2: Station ranking (mean speed + direction arrow) ──────────────────
@@ -382,7 +437,7 @@ def chart_ranking(speed_ts, dir_ts, station_info):
     ax.set_yticks(list(y))
     ax.set_yticklabels(labels, fontsize=8)
     ax.set_xlabel("km/h")
-    ax.set_title(f"Station Rankings (mean speed) — {DATE_STR} SGT", fontsize=11, pad=8)
+    ax.set_title(f"Station Rankings (mean speed) — {PERIOD_LABEL}", fontsize=11, pad=8)
     ax.legend(fontsize=8, loc="lower right")
     ax.grid(True, ls="--", alpha=0.4, axis="x")
     ax.invert_yaxis()
@@ -566,7 +621,7 @@ HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SG Wind Report — {date} {h_start}h–{h_end}h SGT</title>
+<title>SG Wind Report — {period_label}</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
@@ -607,9 +662,11 @@ HTML = """\
   .conv-scale-labels{{display:flex;justify-content:space-between;font-size:.72rem;
                        color:#59636e;margin-top:3px}}
   .conv-scale-caption{{font-size:.72rem;color:#59636e;margin-top:2px}}
+  .table-scroll{{max-height:480px;overflow:auto;border:1px solid #d0d7de;
+                 border-radius:8px}}
   table{{width:100%;border-collapse:collapse;font-size:.82rem}}
   th{{background:#eaeef2;color:#59636e;padding:8px 12px;
-      text-align:left;font-weight:600;position:sticky;top:72px}}
+      text-align:left;font-weight:600;position:sticky;top:0}}
   td{{padding:7px 12px;border-bottom:1px solid #eaeef2}}
   td.num{{text-align:right;font-variant-numeric:tabular-nums}}
   tr:hover td{{background:#f6f8fa}}
@@ -621,7 +678,7 @@ HTML = """\
 <body>
 <header>
   <h1>Singapore Wind Report</h1>
-  <p>{date} &nbsp;·&nbsp; {h_start:02d}:00–{h_end:02d}:59 SGT &nbsp;·&nbsp;
+  <p>{period_label} &nbsp;·&nbsp;
      {n_stations} stations &nbsp;·&nbsp; {n_minutes} minutes
      <span class="badge">NEA / data.gov.sg</span></p>
   <nav>
@@ -660,7 +717,7 @@ HTML = """\
 
 <section id="table">
   <h2>Summary Table</h2>
-  <div style="overflow-x:auto">
+  <div class="table-scroll">
   <table>
     <thead><tr>
       <th>Station ID</th><th>Name</th>
@@ -678,7 +735,7 @@ HTML = """\
 </main>
 <footer>
   Generated by GitHub Actions · Source: NEA / data.gov.sg (Open Data Licence) ·
-  Report date: {date} · Built {built}
+  Report period: {period_label} · Built {built}
 </footer>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
@@ -753,7 +810,7 @@ HTML = """\
 def main():
     print(f"\n{'═'*60}")
     print(f"  SG Wind Report Builder")
-    print(f"  Date: {DATE_STR}  Hours: {HOUR_START:02d}h–{HOUR_END:02d}h SGT")
+    print(f"  Period: {PERIOD_LABEL}")
     print(f"  API key: {'YES' if API_KEY else 'NO (unauthenticated)'}")
     print(f"{'═'*60}\n")
 
@@ -790,9 +847,7 @@ def main():
         conv_scale  = ""
 
     html = HTML.format(
-        date        = DATE_STR,
-        h_start     = HOUR_START,
-        h_end       = HOUR_END,
+        period_label = PERIOD_LABEL,
         n_stations  = n_stations,
         n_minutes   = n_minutes,
         map_data    = map_data,

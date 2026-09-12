@@ -3,18 +3,14 @@ name: Wind Report
 on:
   workflow_dispatch:
     inputs:
-      date:
-        description: "Date to analyse (YYYY-MM-DD, SGT)"
+      start_datetime:
+        description: "Start date & time, SGT (YYYY-MM-DDTHH:MM)"
         required: true
-        default: "2026-09-12"
-      hour_start:
-        description: "Start hour (0-23, SGT)"
+        default: "2026-09-12T08:00"
+      end_datetime:
+        description: "End date & time, inclusive, SGT (YYYY-MM-DDTHH:MM)"
         required: true
-        default: "8"
-      hour_end:
-        description: "End hour inclusive (0-23, SGT)"
-        required: true
-        default: "9"
+        default: "2026-09-12T09:00"
 
 permissions:
   contents: write
@@ -40,9 +36,8 @@ jobs:
       - name: Fetch data and build site
         env:
           NEA_API_KEY: ${{ secrets.NEA_API_KEY }}
-          REPORT_DATE: ${{ inputs.date }}
-          HOUR_START:  ${{ inputs.hour_start }}
-          HOUR_END:    ${{ inputs.hour_end }}
+          START_DATETIME: ${{ inputs.start_datetime }}
+          END_DATETIME:   ${{ inputs.end_datetime }}
         run: python scripts/build.py
 
       - name: Deploy to GitHub Pages
@@ -50,4 +45,4 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./docs
-          commit_message: "report: ${{ inputs.date }} ${{ inputs.hour_start }}h–${{ inputs.hour_end }}h SGT"
+          commit_message: "report: ${{ inputs.start_datetime }} to ${{ inputs.end_datetime }} SGT"
