@@ -241,12 +241,30 @@ def ms_to_kmh(v):
     return np.array(v, dtype=float) * 3.6
 
 
-def mean_direction(dirs):
-    """Circular mean of bearing angles in degrees."""
-    r = np.radians(np.array(dirs, dtype=float))
-    r = r[~np.isnan(r)]
-    if len(r) == 0: return np.nan
-    return math.degrees(math.atan2(np.mean(np.sin(r)), np.mean(np.cos(r)))) % 360
+def vector_mean_wind(speed, direction):
+    """
+    Average wind speed + direction (met bearing, FROM) by decomposing each
+    reading into u/v (eastward/northward) components, averaging those, then
+    recombining into a resultant speed and direction. This is the standard
+    vector-mean wind: a calm, directionally-erratic minute barely moves the
+    average, unlike separately arithmetic-averaging speed and circular-
+    averaging direction, where every minute's direction counts equally
+    regardless of how weak the wind was.
+
+    Returns (mean_speed, mean_dir); both nan if no valid readings.
+    """
+    speed = np.array(speed, dtype=float)
+    direction = np.array(direction, dtype=float)
+    ok = ~np.isnan(speed) & ~np.isnan(direction)
+    if not ok.any():
+        return np.nan, np.nan
+    r = np.radians(direction[ok])
+    u = -speed[ok] * np.sin(r)
+    v = -speed[ok] * np.cos(r)
+    u_mean, v_mean = np.mean(u), np.mean(v)
+    mean_speed = math.hypot(u_mean, v_mean)
+    mean_dir = math.degrees(math.atan2(-u_mean, -v_mean)) % 360
+    return mean_speed, mean_dir
 
 
 def bearing_arrow(deg):
@@ -328,12 +346,13 @@ def chart_ranking(speed_ts, dir_ts, station_info):
         valid_spd = spd[~np.isnan(spd)]
         if len(valid_spd) == 0: continue
         dirs = np.array(dir_ts.get(sid, []), dtype=float)
+        mean_spd, mean_dir = vector_mean_wind(spd, dirs)
         rows.append({
             "sid":  sid,
             "name": station_info.get(sid, {}).get("name", sid),
-            "mean": float(np.nanmean(spd)),
+            "mean": mean_spd,
             "max":  float(np.nanmax(spd)),
-            "dir":  mean_direction(dirs),
+            "dir":  mean_dir,
         })
     rows.sort(key=lambda r: r["mean"], reverse=True)
 
@@ -436,14 +455,15 @@ def build_map_data(speed_ts, dir_ts, station_info):
         valid_spd = spd[~np.isnan(spd)]
         if len(valid_spd) == 0: continue
         dirs = np.array(dir_ts.get(sid, []), dtype=float)
-        mean_dir = mean_direction(dirs)
+        mean_spd, mean_dir = vector_mean_wind(spd, dirs)
+        if np.isnan(mean_spd): continue  # no minute had both a speed and a direction reading
         rows.append({
             "sid":      sid,
             "name":     info["name"],
             "lat":      info["lat"],
             "lon":      info["lon"],
-            "mean_spd": round(float(np.nanmean(spd)), 2),
-            "mean_dir": None if np.isnan(mean_dir) else round(float(mean_dir), 1),
+            "mean_spd": round(mean_spd, 2),
+            "mean_dir": round(mean_dir, 1),
         })
     return rows
 
@@ -457,18 +477,18 @@ def build_table(speed_ts, dir_ts, station_info):
         dirs = np.array(dir_ts.get(sid, []), dtype=float)
         vs   = spd[~np.isnan(spd)]
         if len(vs) == 0: continue
-        mean_dir = mean_direction(dirs)
+        mean_spd, mean_dir = vector_mean_wind(spd, dirs)
         rows.append({
             "sid":     sid,
             "name":    station_info.get(sid, {}).get("name", "—"),
-            "mean":    f"{np.nanmean(spd):.1f}",
+            "mean":    f"{mean_spd:.1f}" if not np.isnan(mean_spd) else "—",
             "max":     f"{np.nanmax(spd):.1f}",
             "min":     f"{np.nanmin(spd):.1f}",
             "dir":     f"{mean_dir:.0f}°" if not np.isnan(mean_dir) else "—",
             "missing": int(np.sum(np.isnan(spd))),
             "n":       len(spd),
         })
-    rows.sort(key=lambda r: float(r["mean"]), reverse=True)
+    rows.sort(key=lambda r: float(r["mean"]) if r["mean"] != "—" else -1.0, reverse=True)
 
     tr = "\n".join(
         f"""<tr>
