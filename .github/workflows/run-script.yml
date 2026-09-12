@@ -1,46 +1,53 @@
-name: Run Python Script
+name: Wind Report
 
-# [PLACEHOLDER: Configure when this workflow should run]
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  schedule:
-    # [PLACEHOLDER: Uncomment to run on a schedule (example: daily at 9 AM UTC)]
-    # - cron: '0 9 * * *'
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Date to analyse (YYYY-MM-DD, SGT)"
+        required: true
+        default: "2026-09-12"
+      hour_start:
+        description: "Start hour (0-23, SGT)"
+        required: true
+        default: "8"
+      hour_end:
+        description: "End hour inclusive (0-23, SGT)"
+        required: true
+        default: "9"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
 
 jobs:
-  run-script:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    
-    strategy:
-      matrix:
-        python-version: ['3.11']  # [PLACEHOLDER: Adjust Python version as needed]
-    
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-      
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-      
+          python-version: "3.12"
+
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          # [PLACEHOLDER: Add pip install commands for required packages]
-          # pip install -r requirements.txt
-      
-      - name: Run Python script
-        run: |
-          python scripts/main.py
-      
-      # [PLACEHOLDER: Add additional steps as needed]
-      # - name: Upload results
-      #   uses: actions/upload-artifact@v3
-      #   with:
-      #     name: results
-      #     path: path/to/results/
+        run: pip install requests numpy matplotlib jinja2
+
+      - name: Fetch data and build site
+        env:
+          NEA_API_KEY: ${{ secrets.NEA_API_KEY }}
+          REPORT_DATE: ${{ inputs.date }}
+          HOUR_START:  ${{ inputs.hour_start }}
+          HOUR_END:    ${{ inputs.hour_end }}
+        run: python scripts/build.py
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./docs
+          commit_message: "report: ${{ inputs.date }} ${{ inputs.hour_start }}h–${{ inputs.hour_end }}h SGT"
