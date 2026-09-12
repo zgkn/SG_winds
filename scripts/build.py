@@ -279,7 +279,13 @@ def vector_mean_wind(speed, direction):
 
 
 def bearing_arrow(deg):
-    """Return (dx, dy) unit vector pointing in met-bearing direction (FROM)."""
+    """
+    Return (dx, dy) unit vector — in standard (east=+x, north=+y) axes —
+    pointing the way the wind is blowing TOWARD. `deg` is the met-bearing
+    the wind blows FROM (standard convention, matching the raw NEA
+    reading): a vector aimed at bearing b is (sin b, cos b), and the
+    travel direction is (deg + 180), so this simplifies to (-sin, -cos).
+    """
     r = math.radians(deg)
     return -math.sin(r), -math.cos(r)
 
@@ -389,7 +395,7 @@ def chart_ranking(speed_ts, dir_ts, station_info):
 def build_map_data(speed_ts, dir_ts, station_info):
     """
     Build the per-station records the Leaflet map renders client-side.
-    Bubble size/colour = mean speed, arrow = mean wind direction (where FROM).
+    Bubble size/colour = mean speed, arrow = direction the wind is blowing toward.
     """
     rows = []
     for sid, spd_raw in speed_ts.items():
@@ -515,7 +521,7 @@ def render_convergence_overlay(convergence):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", transparent=True)
     plt.close(fig)
-    return base64.b64encode(buf.getvalue()).decode()
+    return base64.b64encode(buf.getvalue()).decode(), vmax
 
 
 # ── Summary table ─────────────────────────────────────────────────────────────
@@ -594,9 +600,13 @@ HTML = """\
   .leaflet-control-zoom a{{background:#ffffff;color:#1f2328;border-color:#d0d7de}}
   .leaflet-control-attribution{{background:rgba(255,255,255,.85);color:#59636e}}
   .leaflet-control-attribution a{{color:#0969da}}
-  .map-legend{{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:12px;font-size:.8rem;color:#59636e}}
-  .map-legend .swatch{{display:inline-block;width:12px;height:12px;border-radius:2px;
-                        margin-right:6px;vertical-align:middle}}
+  .conv-scale{{max-width:420px;margin-bottom:16px}}
+  .conv-gradient{{height:14px;border-radius:3px;border:1px solid #d0d7de;
+    background:linear-gradient(to right,#053061,#2166ac,#4393c3,#92c5de,#d1e5f0,
+                #f7f7f7,#fddbc7,#f4a582,#d6604d,#b2182b,#67001f)}}
+  .conv-scale-labels{{display:flex;justify-content:space-between;font-size:.72rem;
+                       color:#59636e;margin-top:3px}}
+  .conv-scale-caption{{font-size:.72rem;color:#59636e;margin-top:2px}}
   table{{width:100%;border-collapse:collapse;font-size:.82rem}}
   th{{background:#eaeef2;color:#59636e;padding:8px 12px;
       text-align:left;font-weight:600;position:sticky;top:72px}}
@@ -627,14 +637,11 @@ HTML = """\
   <h2>Geographic Overview</h2>
   <p style="color:#59636e;font-size:.82rem;margin-bottom:8px">
     Drag to pan, scroll or use the +/- controls to zoom. Circles: size and colour = mean
-    wind speed, arrow = mean wind direction (where FROM). Shaded grid overlay: wind
+    wind speed, arrow = direction the wind is blowing toward. Shaded grid overlay: wind
     convergence, interpolated from station wind vectors (u/v averaged onto a grid, then
     the grid's divergence computed) — each tile is one grid cell.
   </p>
-  <div class="map-legend">
-    <span><span class="swatch" style="background:#b2182b"></span>Convergence (uplift-favourable)</span>
-    <span><span class="swatch" style="background:#2166ac"></span>Divergence</span>
-  </div>
+  {conv_scale}
   <div class="map-wrap"><div id="leaflet-map"></div></div>
 </section>
 
@@ -646,7 +653,7 @@ HTML = """\
 <section id="ranking">
   <h2>Station Rankings</h2>
   <p style="color:#59636e;font-size:.82rem;margin-bottom:12px">
-    Bars show mean (solid) and max (translucent). Blue arrow = mean wind direction.
+    Bars show mean (solid) and max (translucent). Blue arrow = direction the wind is blowing toward.
   </p>
   <div class="chart-wrap"><img src="data:image/png;base64,{img_rank}" alt="rankings"></div>
 </section>
@@ -722,7 +729,9 @@ HTML = """\
     );
 
     if (s.mean_dir !== null) {{
-      var rot = s.mean_dir - 90;
+      // s.mean_dir is the met-bearing the wind blows FROM; the arrow should
+      // point the way the wind is blowing TOWARD, i.e. that bearing + 180.
+      var rot = s.mean_dir + 90;
       var icon = L.divIcon({{
         className: 'wind-arrow',
         html: '<div style="transform:rotate(' + rot + 'deg)">&#10148;</div>',
@@ -763,11 +772,22 @@ def main():
     print("  Interpolating convergence field …")
     convergence = build_convergence_field(speed_ts, dir_ts, station_info)
     if convergence is not None:
-        conv_image  = json.dumps("data:image/png;base64," + render_convergence_overlay(convergence))
+        conv_img_b64, conv_vmax = render_convergence_overlay(convergence)
+        conv_image  = json.dumps("data:image/png;base64," + conv_img_b64)
         conv_bounds = json.dumps(CONV_BOUNDS)
+        conv_scale = f"""<div class="conv-scale">
+    <div class="conv-gradient"></div>
+    <div class="conv-scale-labels">
+      <span>&minus;{conv_vmax:.1f} divergence</span>
+      <span>0</span>
+      <span>+{conv_vmax:.1f} convergence</span>
+    </div>
+    <div class="conv-scale-caption">Wind convergence, &times;10&#8315;&#8308; s&#8315;&#185; (interpolated)</div>
+  </div>"""
     else:
         conv_image  = "null"
         conv_bounds = "null"
+        conv_scale  = ""
 
     html = HTML.format(
         date        = DATE_STR,
@@ -778,6 +798,7 @@ def main():
         map_data    = map_data,
         conv_image  = conv_image,
         conv_bounds = conv_bounds,
+        conv_scale  = conv_scale,
         img_spag    = img_spag,
         img_rank    = img_rank,
         table_rows  = tbl_rows,
