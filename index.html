@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SG Wind Report — 2026-09-12 8h–9h SGT</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#0d1117;color:#e6edf3;font-family:'Courier New',monospace;
@@ -25,8 +26,17 @@
                border-radius:8px;overflow:hidden;padding:8px}
   .chart-wrap img{width:100%;height:auto;display:block}
   .map-wrap{background:#161b22;border:1px solid #30363d;
-             border-radius:8px;overflow:hidden;padding:8px;
-             display:flex;justify-content:center}
+             border-radius:8px;overflow:hidden}
+  #leaflet-map{height:520px;width:100%;background:#0d1117}
+  .wind-arrow{color:#58a6ff;font-size:18px;line-height:20px;text-align:center;
+               text-shadow:0 0 3px #000;pointer-events:none}
+  .leaflet-popup-content-wrapper{background:#161b22;color:#e6edf3;
+               border:1px solid #30363d;font-family:'Courier New',monospace}
+  .leaflet-popup-tip{background:#161b22}
+  .leaflet-container a.leaflet-popup-close-button{color:#8b949e}
+  .leaflet-control-zoom a{background:#161b22;color:#e6edf3;border-color:#30363d}
+  .leaflet-control-attribution{background:rgba(22,27,34,.8);color:#8b949e}
+  .leaflet-control-attribution a{color:#58a6ff}
   table{width:100%;border-collapse:collapse;font-size:.82rem}
   th{background:#1f2937;color:#8b949e;padding:8px 12px;
       text-align:left;font-weight:600;position:sticky;top:72px}
@@ -58,59 +68,10 @@
 <section id="map">
   <h2>Geographic Overview</h2>
   <p style="color:#8b949e;font-size:.82rem;margin-bottom:12px">
-    Bubble size and colour = mean wind speed. Arrow = mean wind direction (where FROM).
+    Drag to pan, scroll or use the +/- controls to zoom. Circle size and colour = mean
+    wind speed. Arrow = mean wind direction (where FROM).
   </p>
-  <div class="map-wrap"><svg xmlns="http://www.w3.org/2000/svg" width="700" height="500"
-  style="background:#161b22;border-radius:8px">
-  <defs>
-    <marker id="arr" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
-      <path d="M0,0 L6,3 L0,6 Z" fill="#58a6ff"/>
-    </marker>
-  </defs>
-  <!-- Singapore rough outline hint -->
-  <text x="350" y="22" text-anchor="middle" font-size="11"
-    fill="#8b949e">Singapore — Mean Wind Speed &amp; Direction</text>
-  <circle cx="161.2" cy="395.3" r="15.0" fill="#ff855e" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Banyan Road (Jurong Island) (S117)
-Mean: 15.5 km/h
-Dir: 311°</title></circle><circle cx="77.6" cy="331.9" r="14.6" fill="#ff8761" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Tuas South Avenue 3 (S115)
-Mean: 14.9 km/h
-Dir: 10°</title></circle><circle cx="298.5" cy="497.7" r="28.0" fill="#ff4500" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Semakau Island (S102)
-Mean: 38.1 km/h
-Dir: 170°</title></circle><circle cx="455.5" cy="354.2" r="13.4" fill="#ff8d69" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Marina Barrage (S108)
-Mean: 12.9 km/h
-Dir: 321°</title></circle><circle cx="482.3" cy="257.0" r="12.2" fill="#ff9372" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Kim Chuan Road (S43)
-Mean: 10.7 km/h
-Dir: 338°</title></circle><circle cx="391.3" cy="401.4" r="11.9" fill="#ff9474" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Artillery Avenue (Sentosa) (S60)
-Mean: 10.3 km/h
-Dir: 311°</title></circle><circle cx="328.1" cy="91.8" r="15.8" fill="#ff8158" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Woodlands Avenue 9 (S104)
-Mean: 16.9 km/h
-Dir: 314°</title></circle><circle cx="281.7" cy="350.2" r="21.3" fill="#ff6630" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Pasir Panjang Terminal (S116)
-Mean: 26.5 km/h
-Dir: 6°</title></circle><circle cx="506.0" cy="230.8" r="10.4" fill="#ff9c80" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Paya Lebar Meteorological Station (S06)
-Mean: 7.6 km/h
-Dir: 349°</title></circle><circle cx="404.8" cy="305.0" r="13.4" fill="#ff8d6a" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Scotts Road (S111)
-Mean: 12.7 km/h
-Dir: 273°</title></circle><circle cx="600.9" cy="135.1" r="10.2" fill="#ff9d81" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Jalan Noordin (Pulau Ubin) (S106)
-Mean: 7.2 km/h
-Dir: 344°</title></circle><circle cx="172.6" cy="248.7" r="16.8" fill="#ff7c51" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Nanyang Avenue (S44)
-Mean: 18.7 km/h
-Dir: 321°</title></circle><circle cx="593.0" cy="300.7" r="15.8" fill="#ff8158" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>East Coast Park (S107)
-Mean: 16.9 km/h
-Dir: 286°</title></circle><circle cx="217.9" cy="184.7" r="15.3" fill="#ff845c" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Tengah Meteorological Station (S23)
-Mean: 16.1 km/h
-Dir: 320°</title></circle><circle cx="232.6" cy="203.9" r="12.9" fill="#ff906e" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Old Choa Chu Kang Road (S121)
-Mean: 11.9 km/h
-Dir: 310°</title></circle><circle cx="314.3" cy="271.1" r="12.6" fill="#ff916f" fill-opacity="0.82" stroke="#fff" stroke-width="1"><title>Clementi Road (S50)
-Mean: 11.5 km/h
-Dir: 299°</title></circle>
-  <line x1="161.2" y1="395.3" x2="178.2" y2="380.7" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="77.6" y1="331.9" x2="73.7" y2="310.4" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="298.5" y1="497.7" x2="291.5" y2="539.1" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="455.5" y1="354.2" x2="468.2" y2="338.5" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="482.3" y1="257.0" x2="489.2" y2="240.1" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="391.3" y1="401.4" x2="404.8" y2="389.6" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="328.1" y1="91.8" x2="345.2" y2="75.4" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="281.7" y1="350.2" x2="278.5" y2="318.3" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="506.0" y1="230.8" x2="509.0" y2="215.5" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="404.8" y1="305.0" x2="424.8" y2="304.1" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="600.9" y1="135.1" x2="605.2" y2="120.5" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="172.6" y1="248.7" x2="188.5" y2="229.1" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="593.0" y1="300.7" x2="615.7" y2="294.1" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="217.9" y1="184.7" x2="232.5" y2="167.0" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="232.6" y1="203.9" x2="247.3" y2="191.5" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/><line x1="314.3" y1="271.1" x2="330.9" y2="262.0" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
-  <text x="161.2" y="420.2" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S117</text><text x="77.6" y="356.5" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S115</text><text x="298.5" y="535.7" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S102</text><text x="455.5" y="377.6" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S108</text><text x="482.3" y="279.2" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S43</text><text x="391.3" y="423.3" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S60</text><text x="328.1" y="117.5" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S104</text><text x="281.7" y="381.5" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S116</text><text x="506.0" y="251.2" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S06</text><text x="404.8" y="328.4" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S111</text><text x="600.9" y="155.3" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S106</text><text x="172.6" y="275.5" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S44</text><text x="593.0" y="326.5" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S107</text><text x="217.9" y="210.0" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S23</text><text x="232.6" y="226.8" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S121</text><text x="314.3" y="293.7" text-anchor="middle" font-size="8" fill="#e6edf3" opacity="0.9">S50</text>
-  <!-- Legend -->
-  <circle cx="60" cy="470" r="6" fill="#ffff80" stroke="#fff" stroke-width="1"/>
-  <text x="75" y="474" font-size="8" fill="#8b949e">low speed</text>
-  <circle cx="60" cy="486" r="28" fill="#ff4500" stroke="#fff" stroke-width="1"/>
-  <text x="75" y="490" font-size="8" fill="#8b949e">high speed</text>
-</svg></div>
+  <div class="map-wrap"><div id="leaflet-map"></div></div>
 </section>
 
 <section id="timeseries">
@@ -179,20 +140,20 @@ Dir: 299°</title></circle>
           <td class="num">0/120</td>
         </tr>
 <tr>
-          <td>S104</td><td>Woodlands Avenue 9</td>
-          <td class="num">16.9</td>
-          <td class="num">39.2</td>
-          <td class="num">4.7</td>
-          <td class="num">314°</td>
-          <td class="num">0/120</td>
-        </tr>
-<tr>
           <td>S107</td><td>East Coast Park</td>
           <td class="num">16.9</td>
           <td class="num">27.7</td>
           <td class="num">8.6</td>
           <td class="num">286°</td>
           <td class="num">1/120</td>
+        </tr>
+<tr>
+          <td>S104</td><td>Woodlands Avenue 9</td>
+          <td class="num">16.9</td>
+          <td class="num">39.2</td>
+          <td class="num">4.7</td>
+          <td class="num">314°</td>
+          <td class="num">0/120</td>
         </tr>
 <tr>
           <td>S23</td><td>Tengah Meteorological Station</td>
@@ -289,7 +250,63 @@ Dir: 299°</title></circle>
 </main>
 <footer>
   Generated by GitHub Actions · Source: NEA / data.gov.sg (Open Data Licence) ·
-  Report date: 2026-09-12 · Built 2026-09-12 10:32 UTC
+  Report date: 2026-09-12 · Built 2026-09-12 12:16 UTC
 </footer>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function() {
+  var stations = [{"sid": "S60", "name": "Artillery Avenue (Sentosa)", "lat": 1.2504, "lon": 103.8275, "mean_spd": 10.28, "mean_dir": 311.1}, {"sid": "S111", "name": "Scotts Road", "lat": 1.3106, "lon": 103.8365, "mean_spd": 12.74, "mean_dir": 272.7}, {"sid": "S06", "name": "Paya Lebar Meteorological Station", "lat": 1.357, "lon": 103.904, "mean_spd": 7.59, "mean_dir": 349.0}, {"sid": "S106", "name": "Jalan Noordin (Pulau Ubin)", "lat": 1.4168, "lon": 103.9673, "mean_spd": 7.2, "mean_dir": 343.9}, {"sid": "S107", "name": "East Coast Park", "lat": 1.3133, "lon": 103.962, "mean_spd": 16.92, "mean_dir": 286.1}, {"sid": "S116", "name": "Pasir Panjang Terminal", "lat": 1.2824, "lon": 103.7545, "mean_spd": 26.5, "mean_dir": 5.9}, {"sid": "S108", "name": "Marina Barrage", "lat": 1.2799, "lon": 103.8703, "mean_spd": 12.88, "mean_dir": 320.8}, {"sid": "S23", "name": "Tengah Meteorological Station", "lat": 1.3858, "lon": 103.7119, "mean_spd": 16.12, "mean_dir": 320.3}, {"sid": "S104", "name": "Woodlands Avenue 9", "lat": 1.4439, "lon": 103.7854, "mean_spd": 16.9, "mean_dir": 313.7}, {"sid": "S117", "name": "Banyan Road (Jurong Island)", "lat": 1.2542, "lon": 103.6741, "mean_spd": 15.5, "mean_dir": 310.6}, {"sid": "S44", "name": "Nanyang Avenue", "lat": 1.3458, "lon": 103.6817, "mean_spd": 18.72, "mean_dir": 320.9}, {"sid": "S102", "name": "Semakau Island", "lat": 1.1902, "lon": 103.7657, "mean_spd": 38.05, "mean_dir": 170.4}, {"sid": "S43", "name": "Kim Chuan Road", "lat": 1.3406, "lon": 103.8882, "mean_spd": 10.71, "mean_dir": 337.7}, {"sid": "S50", "name": "Clementi Road", "lat": 1.3318, "lon": 103.7762, "mean_spd": 11.46, "mean_dir": 298.8}, {"sid": "S121", "name": "Old Choa Chu Kang Road", "lat": 1.3738, "lon": 103.7217, "mean_spd": 11.88, "mean_dir": 310.2}, {"sid": "S115", "name": "Tuas South Avenue 3", "lat": 1.2938, "lon": 103.6184, "mean_spd": 14.87, "mean_dir": 10.3}];
+  var map = L.map('leaflet-map', {
+    center: [1.3521, 103.8198],
+    zoom: 11,
+    minZoom: 10,
+    maxZoom: 17,
+    scrollWheelZoom: true
+  });
+
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    subdomains: 'abcd',
+    maxZoom: 19
+  }).addTo(map);
+
+  var maxSpd = 1;
+  stations.forEach(function(s) { if (s.mean_spd > maxSpd) maxSpd = s.mean_spd; });
+
+  function speedColor(spd) {
+    var t = spd / maxSpd;
+    var r = 255;
+    var g = Math.round(255 * (1 - t) * 0.7 + 69 * t);
+    var b = Math.round(160 * (1 - t));
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }
+
+  stations.forEach(function(s) {
+    var radius = 6 + (s.mean_spd / maxSpd) * 16;
+    L.circleMarker([s.lat, s.lon], {
+      radius: radius,
+      fillColor: speedColor(s.mean_spd),
+      color: '#fff',
+      weight: 1,
+      fillOpacity: 0.85
+    }).addTo(map).bindPopup(
+      '<b>' + s.name + '</b> (' + s.sid + ')<br>' +
+      'Mean: ' + s.mean_spd.toFixed(1) + ' km/h' +
+      (s.mean_dir !== null ? '<br>Dir: ' + Math.round(s.mean_dir) + '&deg;' : '')
+    );
+
+    if (s.mean_dir !== null) {
+      var rot = s.mean_dir - 90;
+      var icon = L.divIcon({
+        className: 'wind-arrow',
+        html: '<div style="transform:rotate(' + rot + 'deg)">&#10148;</div>',
+        iconSize: [20, 20],
+        iconAnchor: [10, 10]
+      });
+      L.marker([s.lat, s.lon], {icon: icon, interactive: false}).addTo(map);
+    }
+  });
+})();
+</script>
 </body>
 </html>
