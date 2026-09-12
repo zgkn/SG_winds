@@ -10,7 +10,7 @@ Environment variables (set by Actions):
   NEA_API_KEY   optional — doubles rate limit from 6 → 12 calls/10 s
 """
 
-import os, sys, time, json, math, base64, io
+import os, sys, re, time, json, math, base64, io
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.gridspec as gridspec
 from matplotlib.cm import ScalarMappable
-from matplotlib.colors import Normalize
+from matplotlib.colors import Normalize, TwoSlopeNorm
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -241,17 +241,11 @@ def ms_to_kmh(v):
     return np.array(v, dtype=float) * 3.6
 
 
-def vector_mean_wind(speed, direction):
+def mean_uv(speed, direction):
     """
-    Average wind speed + direction (met bearing, FROM) by decomposing each
-    reading into u/v (eastward/northward) components, averaging those, then
-    recombining into a resultant speed and direction. This is the standard
-    vector-mean wind: a calm, directionally-erratic minute barely moves the
-    average, unlike separately arithmetic-averaging speed and circular-
-    averaging direction, where every minute's direction counts equally
-    regardless of how weak the wind was.
-
-    Returns (mean_speed, mean_dir); both nan if no valid readings.
+    Decompose each (speed, direction) reading into u/v (eastward/northward)
+    components and average those. Returns (u_mean, v_mean), both nan if no
+    minute has both a speed and a direction reading.
     """
     speed = np.array(speed, dtype=float)
     direction = np.array(direction, dtype=float)
@@ -261,7 +255,24 @@ def vector_mean_wind(speed, direction):
     r = np.radians(direction[ok])
     u = -speed[ok] * np.sin(r)
     v = -speed[ok] * np.cos(r)
-    u_mean, v_mean = np.mean(u), np.mean(v)
+    return float(np.mean(u)), float(np.mean(v))
+
+
+def vector_mean_wind(speed, direction):
+    """
+    Average wind speed + direction (met bearing, FROM) by decomposing each
+    reading into u/v components (see mean_uv), then recombining the averaged
+    components back into a resultant speed and direction. This is the
+    standard vector-mean wind: a calm, directionally-erratic minute barely
+    moves the average, unlike separately arithmetic-averaging speed and
+    circular-averaging direction, where every minute's direction counts
+    equally regardless of how weak the wind was.
+
+    Returns (mean_speed, mean_dir); both nan if no valid readings.
+    """
+    u_mean, v_mean = mean_uv(speed, direction)
+    if np.isnan(u_mean):
+        return np.nan, np.nan
     mean_speed = math.hypot(u_mean, v_mean)
     mean_dir = math.degrees(math.atan2(-u_mean, -v_mean)) % 360
     return mean_speed, mean_dir
@@ -273,9 +284,27 @@ def bearing_arrow(deg):
     return -math.sin(r), -math.cos(r)
 
 
+# Common words in NEA station names, abbreviated so chart legends stay compact.
+_NAME_ABBREVIATIONS = [
+    ("Avenue", "Ave"), ("Boulevard", "Blvd"), ("Highway", "Hwy"),
+    ("Gardens", "Gdns"), ("Drive", "Dr"), ("Street", "St"), ("Road", "Rd"),
+    ("Upper", "Up"), ("North", "N"), ("South", "S"), ("East", "E"), ("West", "W"),
+]
+
+
+def shorten_name(name, max_len=18):
+    """Abbreviate common words in a station name, then hard-truncate if still too long."""
+    short = name
+    for full, abbr in _NAME_ABBREVIATIONS:
+        short = re.sub(rf"\b{full}\b", abbr, short)
+    if len(short) > max_len:
+        short = short[:max_len - 1].rstrip() + "…"
+    return short
+
+
 # ── Chart 1: Spaghetti speed time series (all stations) ──────────────────────
 
-def chart_spaghetti(timestamps, speed_ts):
+def chart_spaghetti(timestamps, speed_ts, station_info):
     sids = sorted(speed_ts)
     cmap = matplotlib.colormaps["tab20"].resampled(len(sids))
     t_arr = np.array(timestamps)
@@ -285,8 +314,9 @@ def chart_spaghetti(timestamps, speed_ts):
 
     for i, sid in enumerate(sids):
         spd = ms_to_kmh(speed_ts[sid])
+        name = station_info.get(sid, {}).get("name", sid)
         ax.plot(t_arr, spd, color=cmap(i), lw=1.2, alpha=0.8,
-                label=sid)
+                label=shorten_name(name))
 
     ax.set_title(f"Wind Speed — All Stations  |  {DATE_STR}  {HOUR_START:02d}:00–{HOUR_END:02d}:59 SGT",
                  fontsize=11, pad=8)
@@ -294,50 +324,14 @@ def chart_spaghetti(timestamps, speed_ts):
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.xaxis.set_major_locator(mdates.MinuteLocator(byminute=range(0, 60*(HOUR_END-HOUR_START+1), 5)))
     ax.tick_params(axis="x", rotation=45, labelsize=8)
-    ax.legend(ncol=4, fontsize=7, loc="upper right",
+    ax.legend(ncol=3, fontsize=6.5, loc="upper right",
               framealpha=0.7, handlelength=1.2)
     ax.grid(True, ls="--", alpha=0.4)
     ax.set_xlabel("Time (SGT)")
     return fig_to_b64(fig)
 
 
-# ── Chart 2: Heatmap — station × time (speed) ────────────────────────────────
-
-def chart_heatmap(timestamps, speed_ts, station_info):
-    sids = sorted(speed_ts, key=lambda s: station_info.get(s, {}).get("name", s))
-    n_time = len(timestamps)
-    matrix = np.full((len(sids), n_time), np.nan)
-    for row, sid in enumerate(sids):
-        matrix[row] = ms_to_kmh(speed_ts[sid])
-
-    fig, ax = plt.subplots(figsize=(14, max(4, len(sids) * 0.45)))
-    fig.patch.set_facecolor(BG)
-
-    im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd",
-                   vmin=0, vmax=np.nanpercentile(matrix, 97),
-                   interpolation="nearest")
-
-    # x-axis: every 5 minutes
-    step = max(1, n_time // 12)
-    ax.set_xticks(range(0, n_time, step))
-    ax.set_xticklabels([timestamps[i].strftime("%H:%M") for i in range(0, n_time, step)],
-                       rotation=45, fontsize=7)
-
-    # y-axis: station names
-    labels = [station_info.get(sid, {}).get("name", sid) + f" ({sid})" for sid in sids]
-    ax.set_yticks(range(len(sids)))
-    ax.set_yticklabels(labels, fontsize=8)
-
-    cb = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
-    cb.set_label("km/h", color=TEXT)
-    cb.ax.yaxis.set_tick_params(color=MUTED, labelcolor=MUTED)
-
-    ax.set_title(f"Speed Heatmap — All Stations  |  {DATE_STR} SGT", fontsize=11, pad=8)
-    fig.tight_layout()
-    return fig_to_b64(fig)
-
-
-# ── Chart 3: Station ranking (mean speed + direction arrow) ──────────────────
+# ── Chart 2: Station ranking (mean speed + direction arrow) ──────────────────
 
 def chart_ranking(speed_ts, dir_ts, station_info):
     rows = []
@@ -390,56 +384,6 @@ def chart_ranking(speed_ts, dir_ts, station_info):
     return fig_to_b64(fig)
 
 
-# ── Chart 4: Polar wind roses — small multiples ──────────────────────────────
-
-def chart_roses(speed_ts, dir_ts, station_info):
-    sids = [s for s in sorted(speed_ts)
-            if np.any(~np.isnan(np.array(dir_ts.get(s, [np.nan]), dtype=float)))]
-    n = len(sids)
-    cols = 4
-    rows = math.ceil(n / cols)
-
-    fig = plt.figure(figsize=(cols * 3.2, rows * 3.0))
-    fig.patch.set_facecolor(BG)
-
-    bin_edges = np.arange(0, 361, 20)   # 18 directional bins of 20°
-
-    for i, sid in enumerate(sids):
-        ax = fig.add_subplot(rows, cols, i + 1, projection="polar")
-        ax.set_facecolor(PANEL)
-        ax.set_theta_zero_location("N")
-        ax.set_theta_direction(-1)
-        ax.tick_params(colors=MUTED, labelsize=6)
-        ax.grid(color=GRID, lw=0.5)
-
-        spd  = ms_to_kmh(np.array(speed_ts[sid], dtype=float))
-        dirs = np.array(dir_ts.get(sid, []), dtype=float)
-        ok   = ~np.isnan(spd) & ~np.isnan(dirs)
-
-        if ok.any():
-            # Bin by direction, colour by mean speed in bin
-            counts, _ = np.histogram(dirs[ok], bins=bin_edges)
-            bin_spd   = []
-            for j in range(len(bin_edges) - 1):
-                mask = ok & (dirs >= bin_edges[j]) & (dirs < bin_edges[j+1])
-                bin_spd.append(float(np.nanmean(spd[mask])) if mask.any() else 0)
-
-            theta   = np.radians((bin_edges[:-1] + bin_edges[1:]) / 2)
-            width   = np.radians(18)
-            cmap    = matplotlib.colormaps["YlOrRd"]
-            max_spd = max(bin_spd) if max(bin_spd) > 0 else 1
-            colors  = [cmap(s / max_spd) for s in bin_spd]
-            ax.bar(theta, counts, width=width, color=colors, alpha=0.85, align="center")
-
-        name = station_info.get(sid, {}).get("name", sid)
-        ax.set_title(f"{name}\n({sid})", fontsize=7, pad=4, color=TEXT)
-
-    fig.suptitle(f"Wind Roses — All Stations  |  {DATE_STR} SGT",
-                 fontsize=11, y=1.01, color=TEXT)
-    fig.tight_layout()
-    return fig_to_b64(fig)
-
-
 # ── Map: pannable Leaflet map of Singapore ───────────────────────────────────
 
 def build_map_data(speed_ts, dir_ts, station_info):
@@ -466,6 +410,98 @@ def build_map_data(speed_ts, dir_ts, station_info):
             "mean_dir": round(mean_dir, 1),
         })
     return rows
+
+
+# Grid extent for the convergence field — a bit wider than the station
+# spread so the interpolation/overlay covers the whole visible basemap.
+CONV_LAT_MIN, CONV_LAT_MAX = 1.16, 1.48
+CONV_LON_MIN, CONV_LON_MAX = 103.58, 104.10
+CONV_BOUNDS = [[CONV_LAT_MIN, CONV_LON_MIN], [CONV_LAT_MAX, CONV_LON_MAX]]
+
+
+def build_convergence_field(speed_ts, dir_ts, station_info, grid_n=70):
+    """
+    Interpolate station-mean u/v wind components onto a regular lat/lon
+    grid (inverse-distance weighting), then compute the horizontal wind
+    convergence of the interpolated field: convergence = -(du/dx + dv/dy).
+
+    Positive convergence = air piling up (favours uplift/showers);
+    negative = divergence (air spreading out).
+
+    Returns a 2D array (grid_n x grid_n, row 0 = CONV_LAT_MIN) of
+    convergence in units of 1e-4 s^-1, or None if fewer than 3 stations
+    have a usable wind vector.
+    """
+    lats, lons, us, vs = [], [], [], []
+    for sid, spd_raw in speed_ts.items():
+        info = station_info.get(sid)
+        if not info or info["lat"] == 0: continue
+        spd = ms_to_kmh(spd_raw)
+        dirs = np.array(dir_ts.get(sid, []), dtype=float)
+        u, v = mean_uv(spd, dirs)
+        if np.isnan(u): continue
+        lats.append(info["lat"]); lons.append(info["lon"])
+        us.append(u); vs.append(v)
+
+    if len(lats) < 3:
+        return None
+
+    lats, lons = np.array(lats), np.array(lons)
+    us, vs = np.array(us), np.array(vs)
+
+    grid_lat = np.linspace(CONV_LAT_MIN, CONV_LAT_MAX, grid_n)
+    grid_lon = np.linspace(CONV_LON_MIN, CONV_LON_MAX, grid_n)
+    glon, glat = np.meshgrid(grid_lon, grid_lat)  # both (grid_n, grid_n)
+
+    # Inverse-distance-weighted interpolation (power=2). Degrees are fine
+    # as a distance metric at Singapore's scale/latitude (~0.3° across).
+    d2 = ((lats[:, None] - glat.ravel()[None, :]) ** 2 +
+          (lons[:, None] - glon.ravel()[None, :]) ** 2)
+    d2 = np.maximum(d2, 1e-12)
+    w = 1.0 / d2
+    u_grid = (w * us[:, None]).sum(axis=0) / w.sum(axis=0)
+    v_grid = (w * vs[:, None]).sum(axis=0) / w.sum(axis=0)
+    u_grid = u_grid.reshape(glat.shape)
+    v_grid = v_grid.reshape(glat.shape)
+
+    # Degree spacing -> metres, so the gradient is a physically-scaled s^-1 rate.
+    mean_lat_rad = math.radians(np.mean(lats))
+    dx_m = (grid_lon[1] - grid_lon[0]) * 111_320 * math.cos(mean_lat_rad)
+    dy_m = (grid_lat[1] - grid_lat[0]) * 110_540
+
+    du_dx = np.gradient(u_grid / 3.6, dx_m, axis=1)  # km/h -> m/s first
+    dv_dy = np.gradient(v_grid / 3.6, dy_m, axis=0)
+    convergence = -(du_dx + dv_dy) * 1e4  # x1e-4 s^-1, a typical display scale
+    return convergence
+
+
+def render_convergence_overlay(convergence):
+    """
+    Render the convergence field as a transparent PNG for a Leaflet image
+    overlay. Red = convergence, blue = divergence; magnitude sets opacity
+    so weak/near-zero areas fade toward transparent instead of masking the
+    basemap under a solid tint.
+    """
+    fig = plt.figure(figsize=(6, 6), dpi=150)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    fig.patch.set_alpha(0)
+
+    vmax = max(float(np.nanmax(np.abs(convergence))), 1e-6)
+    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+    cmap = matplotlib.colormaps["RdBu_r"]
+    rgba = cmap(norm(convergence))
+    rgba[..., 3] = np.clip(np.abs(convergence) / vmax, 0, 1) * 0.75
+
+    # row 0 = CONV_LAT_MIN (south); origin="lower" puts it at the bottom of
+    # the rendered image, matching Leaflet's image-overlay convention where
+    # the saved PNG's top edge maps to the bounds' north edge.
+    ax.imshow(rgba, origin="lower", interpolation="bilinear", aspect="auto")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", transparent=True)
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 # ── Summary table ─────────────────────────────────────────────────────────────
@@ -544,6 +580,9 @@ HTML = """\
   .leaflet-control-zoom a{{background:#161b22;color:#e6edf3;border-color:#30363d}}
   .leaflet-control-attribution{{background:rgba(22,27,34,.8);color:#8b949e}}
   .leaflet-control-attribution a{{color:#58a6ff}}
+  .map-legend{{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:12px;font-size:.8rem;color:#8b949e}}
+  .map-legend .swatch{{display:inline-block;width:12px;height:12px;border-radius:2px;
+                        margin-right:6px;vertical-align:middle}}
   table{{width:100%;border-collapse:collapse;font-size:.82rem}}
   th{{background:#1f2937;color:#8b949e;padding:8px 12px;
       text-align:left;font-weight:600;position:sticky;top:72px}}
@@ -564,9 +603,7 @@ HTML = """\
   <nav>
     <a href="#map">Map</a>
     <a href="#timeseries">Time Series</a>
-    <a href="#heatmap">Heatmap</a>
     <a href="#ranking">Rankings</a>
-    <a href="#roses">Wind Roses</a>
     <a href="#table">Data Table</a>
   </nav>
 </header>
@@ -574,10 +611,16 @@ HTML = """\
 
 <section id="map">
   <h2>Geographic Overview</h2>
-  <p style="color:#8b949e;font-size:.82rem;margin-bottom:12px">
-    Drag to pan, scroll or use the +/- controls to zoom. Circle size and colour = mean
-    wind speed. Arrow = mean wind direction (where FROM).
+  <p style="color:#8b949e;font-size:.82rem;margin-bottom:8px">
+    Drag to pan, scroll or use the +/- controls to zoom. Circles: size and colour = mean
+    wind speed, arrow = mean wind direction (where FROM). Shaded overlay: wind convergence,
+    interpolated from station wind vectors (u/v averaged, then combined back into a
+    speed and direction).
   </p>
+  <div class="map-legend">
+    <span><span class="swatch" style="background:#b2182b"></span>Convergence (uplift-favourable)</span>
+    <span><span class="swatch" style="background:#2166ac"></span>Divergence</span>
+  </div>
   <div class="map-wrap"><div id="leaflet-map"></div></div>
 </section>
 
@@ -586,28 +629,12 @@ HTML = """\
   <div class="chart-wrap"><img src="data:image/png;base64,{img_spag}" alt="time series"></div>
 </section>
 
-<section id="heatmap">
-  <h2>Speed Heatmap — Station × Time</h2>
-  <p style="color:#8b949e;font-size:.82rem;margin-bottom:12px">
-    Darker = faster. Gaps = missing data.
-  </p>
-  <div class="chart-wrap"><img src="data:image/png;base64,{img_heat}" alt="heatmap"></div>
-</section>
-
 <section id="ranking">
   <h2>Station Rankings</h2>
   <p style="color:#8b949e;font-size:.82rem;margin-bottom:12px">
     Bars show mean (solid) and max (translucent). Blue arrow = mean wind direction.
   </p>
   <div class="chart-wrap"><img src="data:image/png;base64,{img_rank}" alt="rankings"></div>
-</section>
-
-<section id="roses">
-  <h2>Wind Roses — Small Multiples</h2>
-  <p style="color:#8b949e;font-size:.82rem;margin-bottom:12px">
-    Bar length = frequency. Colour = mean speed in that sector (yellow → red).
-  </p>
-  <div class="chart-wrap"><img src="data:image/png;base64,{img_rose}" alt="wind roses"></div>
 </section>
 
 <section id="table">
@@ -649,6 +676,11 @@ HTML = """\
     subdomains: 'abcd',
     maxZoom: 19
   }}).addTo(map);
+
+  var convImage = {conv_image};
+  if (convImage) {{
+    L.imageOverlay(convImage, {conv_bounds}, {{opacity: 1, interactive: false}}).addTo(map);
+  }}
 
   var maxSpd = 1;
   stations.forEach(function(s) {{ if (s.mean_spd > maxSpd) maxSpd = s.mean_spd; }});
@@ -708,27 +740,34 @@ def main():
     print(f"\n  Collected {n_stations} stations × {n_minutes} minutes\n")
 
     print("  Building charts …")
-    img_spag = chart_spaghetti(timestamps, speed_ts)
-    img_heat = chart_heatmap(timestamps, speed_ts, station_info)
+    img_spag = chart_spaghetti(timestamps, speed_ts, station_info)
     img_rank = chart_ranking(speed_ts, dir_ts, station_info)
-    img_rose = chart_roses(speed_ts, dir_ts, station_info)
     map_stations = build_map_data(speed_ts, dir_ts, station_info)
     map_data = json.dumps(map_stations).replace("</", "<\\/")
     tbl_rows = build_table(speed_ts, dir_ts, station_info)
 
+    print("  Interpolating convergence field …")
+    convergence = build_convergence_field(speed_ts, dir_ts, station_info)
+    if convergence is not None:
+        conv_image  = json.dumps("data:image/png;base64," + render_convergence_overlay(convergence))
+        conv_bounds = json.dumps(CONV_BOUNDS)
+    else:
+        conv_image  = "null"
+        conv_bounds = "null"
+
     html = HTML.format(
-        date       = DATE_STR,
-        h_start    = HOUR_START,
-        h_end      = HOUR_END,
-        n_stations = n_stations,
-        n_minutes  = n_minutes,
-        map_data   = map_data,
-        img_spag   = img_spag,
-        img_heat   = img_heat,
-        img_rank   = img_rank,
-        img_rose   = img_rose,
-        table_rows = tbl_rows,
-        built      = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        date        = DATE_STR,
+        h_start     = HOUR_START,
+        h_end       = HOUR_END,
+        n_stations  = n_stations,
+        n_minutes   = n_minutes,
+        map_data    = map_data,
+        conv_image  = conv_image,
+        conv_bounds = conv_bounds,
+        img_spag    = img_spag,
+        img_rank    = img_rank,
+        table_rows  = tbl_rows,
+        built       = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     )
 
     out = DOCS / "index.html"
