@@ -210,12 +210,12 @@ def collect():
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
 
-BG     = "#0d1117"
-PANEL  = "#161b22"
-GRID   = "#30363d"
-TEXT   = "#e6edf3"
-MUTED  = "#8b949e"
-ACCENT = "#58a6ff"
+BG     = "#ffffff"
+PANEL  = "#f6f8fa"
+GRID   = "#d0d7de"
+TEXT   = "#1f2328"
+MUTED  = "#59636e"
+ACCENT = "#0969da"
 
 plt.rcParams.update({
     "figure.facecolor": BG,   "axes.facecolor":   PANEL,
@@ -417,9 +417,12 @@ def build_map_data(speed_ts, dir_ts, station_info):
 CONV_LAT_MIN, CONV_LAT_MAX = 1.16, 1.48
 CONV_LON_MIN, CONV_LON_MAX = 103.58, 104.10
 CONV_BOUNDS = [[CONV_LAT_MIN, CONV_LON_MIN], [CONV_LAT_MAX, CONV_LON_MAX]]
+# Deliberately coarse: fine enough to show spatial structure, coarse enough
+# that each grid cell is a visually distinct tile with its own border.
+CONV_GRID_N = 25
 
 
-def build_convergence_field(speed_ts, dir_ts, station_info, grid_n=70):
+def build_convergence_field(speed_ts, dir_ts, station_info, grid_n=CONV_GRID_N):
     """
     Interpolate station-mean u/v wind components onto a regular lat/lon
     grid (inverse-distance weighting), then compute the horizontal wind
@@ -478,10 +481,18 @@ def build_convergence_field(speed_ts, dir_ts, station_info, grid_n=70):
 def render_convergence_overlay(convergence):
     """
     Render the convergence field as a transparent PNG for a Leaflet image
-    overlay. Red = convergence, blue = divergence; magnitude sets opacity
-    so weak/near-zero areas fade toward transparent instead of masking the
-    basemap under a solid tint.
+    overlay: a mosaic of visibly-separated grid cells (not a smoothed
+    blob), so the interpolation grid itself is legible. Red = convergence,
+    blue = divergence. Colour always spans the full range of that hour's
+    field (TwoSlopeNorm rescales to the field's own min/max each time), and
+    opacity is a fixed constant rather than scaled by magnitude — so the
+    overlay stays visible even in a calm hour with only weak convergence.
     """
+    n_lat, n_lon = convergence.shape
+    grid_lat = np.linspace(CONV_LAT_MIN, CONV_LAT_MAX, n_lat)
+    grid_lon = np.linspace(CONV_LON_MIN, CONV_LON_MAX, n_lon)
+    glon, glat = np.meshgrid(grid_lon, grid_lat)
+
     fig = plt.figure(figsize=(6, 6), dpi=150)
     ax = fig.add_axes([0, 0, 1, 1])
     ax.axis("off")
@@ -490,13 +501,16 @@ def render_convergence_overlay(convergence):
     vmax = max(float(np.nanmax(np.abs(convergence))), 1e-6)
     norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
     cmap = matplotlib.colormaps["RdBu_r"]
-    rgba = cmap(norm(convergence))
-    rgba[..., 3] = np.clip(np.abs(convergence) / vmax, 0, 1) * 0.75
 
-    # row 0 = CONV_LAT_MIN (south); origin="lower" puts it at the bottom of
-    # the rendered image, matching Leaflet's image-overlay convention where
-    # the saved PNG's top edge maps to the bounds' north edge.
-    ax.imshow(rgba, origin="lower", interpolation="bilinear", aspect="auto")
+    # pcolormesh renders each grid cell as a flat, distinct tile (unlike
+    # imshow's smooth interpolation), and edgecolors draws a visible border
+    # around every cell so the grid structure itself is clearly visible.
+    ax.pcolormesh(glon, glat, convergence, cmap=cmap, norm=norm,
+                  shading="nearest", alpha=0.65,
+                  edgecolors="#33415560", linewidth=0.6)
+    ax.set_xlim(CONV_LON_MIN, CONV_LON_MAX)
+    ax.set_ylim(CONV_LAT_MIN, CONV_LAT_MAX)
+    ax.set_aspect("auto")
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", transparent=True)
@@ -550,48 +564,48 @@ HTML = """\
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{background:#0d1117;color:#e6edf3;font-family:'Courier New',monospace;
+  body{{background:#ffffff;color:#1f2328;font-family:'Courier New',monospace;
         font-size:14px;line-height:1.6;padding:0 0 60px}}
-  header{{background:#161b22;border-bottom:1px solid #30363d;
+  header{{background:#f6f8fa;border-bottom:1px solid #d0d7de;
           padding:20px 32px;position:sticky;top:0;z-index:10}}
-  header h1{{font-size:1.2rem;font-weight:700;color:#58a6ff}}
-  header p{{color:#8b949e;font-size:.85rem;margin-top:4px}}
+  header h1{{font-size:1.2rem;font-weight:700;color:#0969da}}
+  header p{{color:#59636e;font-size:.85rem;margin-top:4px}}
   nav{{display:flex;gap:16px;margin-top:12px;flex-wrap:wrap}}
-  nav a{{color:#8b949e;text-decoration:none;font-size:.8rem;
-          padding:3px 8px;border:1px solid #30363d;border-radius:4px}}
-  nav a:hover{{color:#e6edf3;border-color:#58a6ff}}
+  nav a{{color:#59636e;text-decoration:none;font-size:.8rem;
+          padding:3px 8px;border:1px solid #d0d7de;border-radius:4px}}
+  nav a:hover{{color:#1f2328;border-color:#0969da}}
   main{{max-width:1200px;margin:0 auto;padding:32px 24px}}
   section{{margin-bottom:48px}}
-  h2{{font-size:1rem;color:#8b949e;text-transform:uppercase;
+  h2{{font-size:1rem;color:#59636e;text-transform:uppercase;
        letter-spacing:.08em;margin-bottom:16px;padding-bottom:6px;
-       border-bottom:1px solid #30363d}}
-  .chart-wrap{{background:#161b22;border:1px solid #30363d;
+       border-bottom:1px solid #d0d7de}}
+  .chart-wrap{{background:#f6f8fa;border:1px solid #d0d7de;
                border-radius:8px;overflow:hidden;padding:8px}}
   .chart-wrap img{{width:100%;height:auto;display:block}}
-  .map-wrap{{background:#161b22;border:1px solid #30363d;
+  .map-wrap{{background:#f6f8fa;border:1px solid #d0d7de;
              border-radius:8px;overflow:hidden}}
-  #leaflet-map{{height:520px;width:100%;background:#0d1117}}
-  .wind-arrow{{color:#58a6ff;font-size:18px;line-height:20px;text-align:center;
-               text-shadow:0 0 3px #000;pointer-events:none}}
-  .leaflet-popup-content-wrapper{{background:#161b22;color:#e6edf3;
-               border:1px solid #30363d;font-family:'Courier New',monospace}}
-  .leaflet-popup-tip{{background:#161b22}}
-  .leaflet-container a.leaflet-popup-close-button{{color:#8b949e}}
-  .leaflet-control-zoom a{{background:#161b22;color:#e6edf3;border-color:#30363d}}
-  .leaflet-control-attribution{{background:rgba(22,27,34,.8);color:#8b949e}}
-  .leaflet-control-attribution a{{color:#58a6ff}}
-  .map-legend{{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:12px;font-size:.8rem;color:#8b949e}}
+  #leaflet-map{{height:520px;width:100%;background:#f6f8fa}}
+  .wind-arrow{{color:#0969da;font-size:18px;line-height:20px;text-align:center;
+               text-shadow:0 0 3px #fff;pointer-events:none}}
+  .leaflet-popup-content-wrapper{{background:#ffffff;color:#1f2328;
+               border:1px solid #d0d7de;font-family:'Courier New',monospace}}
+  .leaflet-popup-tip{{background:#ffffff}}
+  .leaflet-container a.leaflet-popup-close-button{{color:#59636e}}
+  .leaflet-control-zoom a{{background:#ffffff;color:#1f2328;border-color:#d0d7de}}
+  .leaflet-control-attribution{{background:rgba(255,255,255,.85);color:#59636e}}
+  .leaflet-control-attribution a{{color:#0969da}}
+  .map-legend{{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:12px;font-size:.8rem;color:#59636e}}
   .map-legend .swatch{{display:inline-block;width:12px;height:12px;border-radius:2px;
                         margin-right:6px;vertical-align:middle}}
   table{{width:100%;border-collapse:collapse;font-size:.82rem}}
-  th{{background:#1f2937;color:#8b949e;padding:8px 12px;
+  th{{background:#eaeef2;color:#59636e;padding:8px 12px;
       text-align:left;font-weight:600;position:sticky;top:72px}}
-  td{{padding:7px 12px;border-bottom:1px solid #21262d}}
+  td{{padding:7px 12px;border-bottom:1px solid #eaeef2}}
   td.num{{text-align:right;font-variant-numeric:tabular-nums}}
-  tr:hover td{{background:#1c2128}}
+  tr:hover td{{background:#f6f8fa}}
   .badge{{display:inline-block;padding:2px 6px;border-radius:3px;
-           font-size:.75rem;background:#21262d;color:#8b949e;margin-left:8px}}
-  footer{{text-align:center;color:#484f58;font-size:.75rem;margin-top:40px}}
+           font-size:.75rem;background:#eaeef2;color:#59636e;margin-left:8px}}
+  footer{{text-align:center;color:#6e7781;font-size:.75rem;margin-top:40px}}
 </style>
 </head>
 <body>
@@ -611,11 +625,11 @@ HTML = """\
 
 <section id="map">
   <h2>Geographic Overview</h2>
-  <p style="color:#8b949e;font-size:.82rem;margin-bottom:8px">
+  <p style="color:#59636e;font-size:.82rem;margin-bottom:8px">
     Drag to pan, scroll or use the +/- controls to zoom. Circles: size and colour = mean
-    wind speed, arrow = mean wind direction (where FROM). Shaded overlay: wind convergence,
-    interpolated from station wind vectors (u/v averaged, then combined back into a
-    speed and direction).
+    wind speed, arrow = mean wind direction (where FROM). Shaded grid overlay: wind
+    convergence, interpolated from station wind vectors (u/v averaged onto a grid, then
+    the grid's divergence computed) — each tile is one grid cell.
   </p>
   <div class="map-legend">
     <span><span class="swatch" style="background:#b2182b"></span>Convergence (uplift-favourable)</span>
@@ -631,7 +645,7 @@ HTML = """\
 
 <section id="ranking">
   <h2>Station Rankings</h2>
-  <p style="color:#8b949e;font-size:.82rem;margin-bottom:12px">
+  <p style="color:#59636e;font-size:.82rem;margin-bottom:12px">
     Bars show mean (solid) and max (translucent). Blue arrow = mean wind direction.
   </p>
   <div class="chart-wrap"><img src="data:image/png;base64,{img_rank}" alt="rankings"></div>
@@ -671,7 +685,7 @@ HTML = """\
     scrollWheelZoom: true
   }});
 
-  L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+  L.tileLayer('https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
     subdomains: 'abcd',
     maxZoom: 19
@@ -698,7 +712,7 @@ HTML = """\
     L.circleMarker([s.lat, s.lon], {{
       radius: radius,
       fillColor: speedColor(s.mean_spd),
-      color: '#fff',
+      color: '#1f2328',
       weight: 1,
       fillOpacity: 0.85
     }}).addTo(map).bindPopup(
