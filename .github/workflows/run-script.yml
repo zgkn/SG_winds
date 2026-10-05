@@ -2,15 +2,10 @@ name: Wind Report
 
 on:
   workflow_dispatch:
-    inputs:
-      start_datetime:
-        description: "Start date & time, SGT (YYYY-MM-DDTHH:MM)"
-        required: true
-        default: "2026-09-12T08:00"
-      end_datetime:
-        description: "End date & time, inclusive, SGT (YYYY-MM-DDTHH:MM)"
-        required: true
-        default: "2026-09-12T09:00"
+
+concurrency:
+  group: wind-report
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -31,18 +26,28 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests numpy matplotlib jinja2
+        run: pip install requests
 
       - name: Fetch data and build site
         env:
           NEA_API_KEY: ${{ secrets.NEA_API_KEY }}
-          START_DATETIME: ${{ inputs.start_datetime }}
-          END_DATETIME:   ${{ inputs.end_datetime }}
         run: python scripts/build.py
+
+      - name: Commit updated data store
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/wind.json
+          if git diff --cached --quiet; then
+            echo "No data changes"
+          else
+            git commit -m "data: update 24h wind store"
+            git push
+          fi
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./docs
-          commit_message: "report: ${{ inputs.start_datetime }} to ${{ inputs.end_datetime }} SGT"
+          commit_message: "report: 24h wind update"
