@@ -217,7 +217,11 @@ HTML = """<!doctype html>
   .bar { padding:0 12px 8px; display:flex; gap:8px; flex-wrap:wrap; }
   button { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px;
            padding:8px 12px; cursor:pointer; font:inherit; min-height:36px; }
-  .chips { padding:0 12px 12px; display:grid; gap:6px; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); }
+  .group { padding:0 12px 10px; }
+  .ghead { display:flex; align-items:center; gap:8px; margin:6px 0; }
+  .ghead h3 { margin:0; font-size:13px; flex:1; }
+  .ghead button { min-height:30px; padding:4px 10px; font-size:12px; }
+  .chips { padding:0; display:grid; gap:6px; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); }
   .chip { display:flex; align-items:center; gap:8px; padding:8px 10px; min-height:40px; text-align:left;
           border-radius:20px; font-size:13px; }
   .chip i { width:12px; height:12px; border-radius:50%; flex:none; }
@@ -230,6 +234,7 @@ HTML = """<!doctype html>
     #chart { height:max(420px, 72vh); }
     .panel { margin:0 8px 10px; }
     .chips { grid-template-columns:1fr 1fr; }
+    .group { padding:0 8px 8px; }
     .chip { font-size:12px; padding:6px 8px; border-radius:10px; }
     .hint { padding:0 12px 20px; }
   }
@@ -248,7 +253,7 @@ HTML = """<!doctype html>
     <button id="none">Hide all</button>
     <button id="reset">Reset zoom</button>
   </div>
-  <div class="chips" id="chips"></div>
+  <div id="chips"></div>
 </details>
 <div class="hint" id="hint"></div>
 <script>
@@ -258,7 +263,9 @@ if (typeof Plotly === "undefined") {
   throw new Error("Plotly missing");
 }
 const times = Object.keys(STORE.readings).sort();
-const ids = Object.keys(STORE.stations).sort((a,b) => STORE.stations[a].name.localeCompare(STORE.stations[b].name));
+const rank = id => STORE.regions.indexOf(STORE.stations[id].region);
+const ids = Object.keys(STORE.stations).sort((a,b) =>
+  rank(a) - rank(b) || STORE.stations[a].name.localeCompare(STORE.stations[b].name));
 const COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
 const compass = d => COMPASS[Math.round(d / 22.5) % 16];
 const sgt = t => t.replace("T", " ");   // stored as SGT wall-clock
@@ -274,11 +281,11 @@ ids.forEach((id, i) => {
   const common = { name: st.name, showlegend: false, hoverlabel: { namelength: -1 } };
   speedTraces.push({ ...common, x: times, y: sp, type: "scatter", mode: "lines",
     connectgaps: false, line: { color: palette[i], width: 1.6 }, xaxis: "x", yaxis: "y",
-    hovertemplate: "<b>%{fullData.name}</b><br>%{x|%H:%M}<br>%{y:.1f} km/h<extra></extra>" });
+    hovertemplate: "<b>%{fullData.name}</b> (" + st.region + ")<br>%{x|%H:%M}<br>%{y:.1f} km/h<extra></extra>" });
   dirTraces.push({ ...common, x: times, y: dr, type: "scatter", mode: "markers",
     marker: { color: palette[i], size: 5 }, xaxis: "x2", yaxis: "y2",
     customdata: dr.map(d => d == null ? "" : compass(d)),
-    hovertemplate: "<b>%{fullData.name}</b><br>%{x|%H:%M}<br>%{y}° (%{customdata})<extra></extra>" });
+    hovertemplate: "<b>%{fullData.name}</b> (" + st.region + ")<br>%{x|%H:%M}<br>%{y}° (%{customdata})<extra></extra>" });
 });
 
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
@@ -328,14 +335,28 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", refresh);
 // Station chips (replace the Plotly legend, which does not fit on phones).
 const on = ids.map(() => true);
 const chips = document.getElementById("chips");
-const chipEls = ids.map((id, i) => {
-  const b = document.createElement("button");
-  b.className = "chip"; b.type = "button";
-  b.innerHTML = `<i style="background:${palette[i]}"></i><span></span>`;
-  b.lastChild.textContent = STORE.stations[id].name;
-  b.onclick = () => { on[i] = !on[i]; apply(); };
-  chips.appendChild(b);
-  return b;
+const chipEls = [];
+STORE.regions.forEach(region => {
+  const members = ids.map((id, i) => i).filter(i => STORE.stations[ids[i]].region === region);
+  if (!members.length) return;
+  const g = document.createElement("div"); g.className = "group";
+  const head = document.createElement("div"); head.className = "ghead";
+  head.innerHTML = `<h3>${region} <span style="color:var(--muted);font-weight:400">(${members.length})</span></h3>`;
+  const only = document.createElement("button"); only.type = "button"; only.textContent = "Only";
+  only.onclick = () => { on.fill(false); members.forEach(i => on[i] = true); apply(); };
+  const tog = document.createElement("button"); tog.type = "button"; tog.textContent = "Toggle";
+  tog.onclick = () => { const all = members.every(i => on[i]); members.forEach(i => on[i] = !all); apply(); };
+  head.append(only, tog);
+  const grid = document.createElement("div"); grid.className = "chips";
+  members.forEach(i => {
+    const b = document.createElement("button");
+    b.className = "chip"; b.type = "button";
+    b.innerHTML = `<i style="background:${palette[i]}"></i><span></span>`;
+    b.lastChild.textContent = STORE.stations[ids[i]].name;
+    b.onclick = () => { on[i] = !on[i]; apply(); };
+    grid.appendChild(b); chipEls[i] = b;
+  });
+  g.append(head, grid); chips.appendChild(g);
 });
 function apply() {
   chipEls.forEach((b, i) => b.classList.toggle("off", !on[i]));
@@ -362,8 +383,32 @@ document.getElementById("sub").textContent =
 """
 
 
+REGIONS = ["North", "West", "Central", "East", "South"]
+REGION_OVERRIDES = {
+    "S104": "North",
+    "S115": "West", "S117": "West", "S44": "West", "S23": "West", "S121": "West", "S50": "West",
+    "S111": "Central", "S109": "Central",
+    "S43": "East", "S06": "East", "S107": "East", "S106": "East",
+    "S116": "South", "S102": "South", "S60": "South", "S108": "South",
+}
+
+
+def region_of(sid, info):
+    if sid in REGION_OVERRIDES:
+        return REGION_OVERRIDES[sid]
+    lat, lon = info.get("lat", 0), info.get("lon", 0)
+    if lat > 1.42:  return "North"
+    if lon < 103.78: return "West"
+    if lon > 103.88: return "East"
+    if lat < 1.29:  return "South"
+    return "Central"
+
+
 def render(store):
     DOCS.mkdir(exist_ok=True)
+    store = {**store, "stations": {sid: {**info, "region": region_of(sid, info)}
+                                   for sid, info in store["stations"].items()},
+             "regions": REGIONS}
     payload = json.dumps(store, separators=(",", ":")).replace("</", "<\\/")
     plotly = (Path(__file__).parent / "vendor" / "plotly-basic.min.js").read_text(encoding="utf-8")
     html = HTML.replace("__DATA__", payload).replace("__PLOTLY__", plotly)
