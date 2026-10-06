@@ -205,17 +205,34 @@ HTML = """<!doctype html>
   @media (prefers-color-scheme: dark) {
     :root { --bg:#0d1117; --fg:#e6edf3; --muted:#9198a1; --line:#30363d; --panel:#161b22; }
   }
+  * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
          font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-  header { padding:16px 16px 4px; }
+  header { padding:14px 16px 4px; }
   h1 { margin:0 0 4px; font-size:20px; }
   .sub { color:var(--muted); font-size:13px; }
-  .bar { padding:8px 16px; display:flex; gap:8px; flex-wrap:wrap; }
-  button { background:var(--panel); color:var(--fg); border:1px solid var(--line);
-           border-radius:6px; padding:5px 10px; cursor:pointer; font:inherit; }
-  button:hover { border-color:var(--muted); }
-  #chart { width:100%; height:calc(100vh - 150px); min-height:560px; }
-  .hint { padding:0 16px 16px; color:var(--muted); font-size:12px; }
+  #chart { width:100%; height:max(480px, calc(100vh - 230px)); }
+  .panel { margin:0 16px 12px; border:1px solid var(--line); border-radius:8px; background:var(--panel); }
+  summary { padding:10px 12px; cursor:pointer; font-weight:600; }
+  .bar { padding:0 12px 8px; display:flex; gap:8px; flex-wrap:wrap; }
+  button { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px;
+           padding:8px 12px; cursor:pointer; font:inherit; min-height:36px; }
+  .chips { padding:0 12px 12px; display:grid; gap:6px; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); }
+  .chip { display:flex; align-items:center; gap:8px; padding:8px 10px; min-height:40px; text-align:left;
+          border-radius:20px; font-size:13px; }
+  .chip i { width:12px; height:12px; border-radius:50%; flex:none; }
+  .chip.off { opacity:.45; }
+  .chip.off i { background:transparent !important; border:2px solid var(--muted); }
+  .hint { padding:0 16px 20px; color:var(--muted); font-size:12px; }
+  @media (max-width:640px) {
+    header { padding:10px 12px 2px; }
+    h1 { font-size:18px; }
+    #chart { height:max(420px, 72vh); }
+    .panel { margin:0 8px 10px; }
+    .chips { grid-template-columns:1fr 1fr; }
+    .chip { font-size:12px; padding:6px 8px; border-radius:10px; }
+    .hint { padding:0 12px 20px; }
+  }
 </style>
 </head>
 <body>
@@ -223,14 +240,17 @@ HTML = """<!doctype html>
   <h1>Singapore wind &ndash; past 24 hours</h1>
   <div class="sub" id="sub"></div>
 </header>
-<div class="bar">
-  <button id="all">Show all stations</button>
-  <button id="none">Hide all</button>
-  <button id="reset">Reset zoom</button>
-</div>
 <div id="chart"></div>
-<div class="hint">Drag to zoom, double-click to reset, shift+drag to pan. Click a legend entry to toggle a station,
-double-click one to isolate it. Speed in km/h; direction is the bearing the wind blows <em>from</em>.</div>
+<details class="panel" id="stationPanel" open>
+  <summary>Stations</summary>
+  <div class="bar">
+    <button id="all">Show all</button>
+    <button id="none">Hide all</button>
+    <button id="reset">Reset zoom</button>
+  </div>
+  <div class="chips" id="chips"></div>
+</details>
+<div class="hint" id="hint"></div>
 <script>
 const STORE = __DATA__;
 if (typeof Plotly === "undefined") {
@@ -241,62 +261,101 @@ const times = Object.keys(STORE.readings).sort();
 const ids = Object.keys(STORE.stations).sort((a,b) => STORE.stations[a].name.localeCompare(STORE.stations[b].name));
 const COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
 const compass = d => COMPASS[Math.round(d / 22.5) % 16];
-
 const sgt = t => t.replace("T", " ");   // stored as SGT wall-clock
 const palette = ids.map((_, i) => `hsl(${(i * 137.5) % 360} 65% 48%)`);
+const touch = matchMedia("(pointer: coarse)").matches;
+const narrow = () => innerWidth <= 640;
 
 const speedTraces = [], dirTraces = [];
 ids.forEach((id, i) => {
   const st = STORE.stations[id];
   const sp = times.map(t => (STORE.readings[t].s || {})[id] ?? null);
   const dr = times.map(t => (STORE.readings[t].d || {})[id] ?? null);
-  const common = { name: st.name, legendgroup: id, hoverlabel: { namelength: -1 } };
+  const common = { name: st.name, showlegend: false, hoverlabel: { namelength: -1 } };
   speedTraces.push({ ...common, x: times, y: sp, type: "scatter", mode: "lines",
     connectgaps: false, line: { color: palette[i], width: 1.6 }, xaxis: "x", yaxis: "y",
     hovertemplate: "<b>%{fullData.name}</b><br>%{x|%H:%M}<br>%{y:.1f} km/h<extra></extra>" });
   dirTraces.push({ ...common, x: times, y: dr, type: "scatter", mode: "markers",
-    showlegend: false, marker: { color: palette[i], size: 5 }, xaxis: "x2", yaxis: "y2",
+    marker: { color: palette[i], size: 5 }, xaxis: "x2", yaxis: "y2",
     customdata: dr.map(d => d == null ? "" : compass(d)),
     hovertemplate: "<b>%{fullData.name}</b><br>%{x|%H:%M}<br>%{y}° (%{customdata})<extra></extra>" });
 });
 
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-function layout() {
-  const grid = css("--line"), font = { color: css("--fg") };
-  const ax = extra => ({ gridcolor: grid, zerolinecolor: grid, linecolor: grid, ...extra });
+// Settings that depend on viewport width or colour scheme; safe to re-apply
+// without disturbing the user's zoom.
+function adaptive() {
+  const n = narrow(), fg = css("--fg"), grid = css("--line");
+  const note = (y, text) => ({ xref: "paper", yref: "paper", x: 0, y, xanchor: "left", yanchor: "bottom",
+    showarrow: false, text, font: { size: n ? 11 : 12, color: css("--muted") } });
   return {
-    paper_bgcolor: css("--bg"), plot_bgcolor: css("--bg"), font,
-    margin: { l: 70, r: 20, t: 10, b: 40 },
-    grid: { rows: 2, columns: 1, pattern: "independent", roworder: "top to bottom" },
-    xaxis:  ax({ type: "date", anchor: "y",  domain: [0, 1], matches: "x2", showticklabels: false }),
-    xaxis2: ax({ type: "date", anchor: "y2", domain: [0, 1], tickformat: "%H:%M<br>%d %b", rangeslider: { visible: false } }),
-    yaxis:  ax({ automargin: true, title: { text: "Wind speed (km/h)", standoff: 8 }, domain: [0.54, 1], rangemode: "tozero", fixedrange: false }),
-    yaxis2: ax({ automargin: true, title: { text: "Direction (° from)", standoff: 8 }, domain: [0, 0.46], range: [0, 360],
-                 tickmode: "array", tickvals: [0, 90, 180, 270, 360],
-                 ticktext: ["N 0°", "E 90°", "S 180°", "W 270°", "N 360°"] }),
-    hovermode: "closest", dragmode: "zoom",
-    legend: { orientation: "v", font: { size: 11 } },
+    paper_bgcolor: css("--bg"), plot_bgcolor: css("--bg"),
+    "font.color": fg, "font.size": n ? 10 : 12,
+    "xaxis.gridcolor": grid, "xaxis2.gridcolor": grid, "yaxis.gridcolor": grid, "yaxis2.gridcolor": grid,
+    "yaxis.linecolor": grid, "yaxis2.linecolor": grid, "xaxis2.linecolor": grid,
+    margin: n ? { l: 34, r: 8, t: 24, b: 38 } : { l: 56, r: 20, t: 24, b: 44 },
+    "yaxis2.ticktext": n ? ["N", "E", "S", "W", "N"] : ["N 0°", "E 90°", "S 180°", "W 270°", "N 360°"],
+    "xaxis2.tickformat": n ? "%H:%M" : "%H:%M<br>%d %b",
+    "xaxis2.nticks": n ? 5 : 10,
+    dragmode: touch ? "pan" : "zoom",
+    annotations: [note(1, "Wind speed (km/h)"), note(0.455, "Wind direction, degrees the wind comes from")],
   };
 }
-const config = { responsive: true, displaylogo: false, scrollZoom: true,
-                 modeBarButtonsToRemove: ["lasso2d", "select2d"] };
+const base = {
+  margin: {},
+  grid: { rows: 2, columns: 1, pattern: "independent", roworder: "top to bottom" },
+  xaxis:  { type: "date", anchor: "y",  domain: [0, 1], matches: "x2", showticklabels: false },
+  xaxis2: { type: "date", anchor: "y2", domain: [0, 1], rangeslider: { visible: false } },
+  yaxis:  { domain: [0.54, 1], rangemode: "tozero" },
+  yaxis2: { domain: [0, 0.43], range: [0, 360], tickmode: "array", tickvals: [0, 90, 180, 270, 360] },
+  hovermode: "closest", hoverdistance: 30, showlegend: false,
+};
+const config = { responsive: true, displaylogo: false, scrollZoom: !touch, displayModeBar: true,
+                 modeBarButtonsToRemove: ["lasso2d", "select2d", "autoScale2d"] };
 const el = document.getElementById("chart");
-Plotly.newPlot(el, [...speedTraces, ...dirTraces], layout(), config);
-window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change",
-  () => Plotly.relayout(el, layout()));
+const initial = adaptive();
+const layoutInit = { ...base, ...Object.fromEntries(Object.entries(initial).filter(([k]) => !k.includes("."))) };
+for (const [k, v] of Object.entries(initial)) if (k.includes(".")) {
+  const [o, f] = k.split("."); layoutInit[o] = { ...(layoutInit[o] || {}), [f]: v };
+}
+Plotly.newPlot(el, [...speedTraces, ...dirTraces], layoutInit, config);
 
-const setVisible = v => Plotly.restyle(el, { visible: v }, [...Array(ids.length * 2).keys()]);
-// Plotly toggles legendgroup members together, so only the lines need driving.
-document.getElementById("all").onclick  = () => setVisible(true);
-document.getElementById("none").onclick = () => setVisible("legendonly");
+let timer;
+const refresh = () => { clearTimeout(timer); timer = setTimeout(() => Plotly.relayout(el, adaptive()), 150); };
+addEventListener("resize", refresh);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", refresh);
+
+// Station chips (replace the Plotly legend, which does not fit on phones).
+const on = ids.map(() => true);
+const chips = document.getElementById("chips");
+const chipEls = ids.map((id, i) => {
+  const b = document.createElement("button");
+  b.className = "chip"; b.type = "button";
+  b.innerHTML = `<i style="background:${palette[i]}"></i><span></span>`;
+  b.lastChild.textContent = STORE.stations[id].name;
+  b.onclick = () => { on[i] = !on[i]; apply(); };
+  chips.appendChild(b);
+  return b;
+});
+function apply() {
+  chipEls.forEach((b, i) => b.classList.toggle("off", !on[i]));
+  const vis = [...on, ...on];
+  Plotly.restyle(el, { visible: vis });
+}
+document.getElementById("all").onclick  = () => { on.fill(true);  apply(); };
+document.getElementById("none").onclick = () => { on.fill(false); apply(); };
 document.getElementById("reset").onclick = () =>
   Plotly.relayout(el, { "xaxis.autorange": true, "xaxis2.autorange": true, "yaxis.autorange": true, "yaxis2.range": [0, 360] });
+if (narrow()) document.getElementById("stationPanel").open = false;
+
+document.getElementById("hint").innerHTML = touch
+  ? "Pinch or drag to zoom and pan; tap a line or dot for exact values. Speed in km/h; direction is the bearing the wind blows <em>from</em>."
+  : "Drag to zoom, scroll to zoom, shift+drag to pan, double-click to reset. Hover for exact values. Speed in km/h; direction is the bearing the wind blows <em>from</em>.";
 
 const have = times.filter(t => Object.keys(STORE.readings[t].s || {}).length).length;
 document.getElementById("sub").textContent =
-  `${ids.length} stations · ${have} of ${times.length} time slots with data · ` +
-  (times.length ? `${sgt(times[0])} to ${sgt(times[times.length - 1])} SGT` : "no data yet") +
-  ` · updated ${STORE.updated} SGT`;
+  `${ids.length} stations · ${have}/${times.length} slots · ` +
+  (times.length ? `${sgt(times[0])} → ${sgt(times[times.length - 1])} SGT` : "no data yet");
 </script>
 </body>
 </html>
