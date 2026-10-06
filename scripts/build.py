@@ -199,7 +199,7 @@ HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Singapore Wind – Past 24 Hours</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.35.2/plotly.min.js"></script>
+<script>__PLOTLY__</script>
 <style>
   :root { --bg:#fff; --fg:#1f2328; --muted:#59636e; --line:#d0d7de; --panel:#f6f8fa; }
   @media (prefers-color-scheme: dark) {
@@ -233,6 +233,10 @@ HTML = """<!doctype html>
 double-click one to isolate it. Speed in km/h; direction is the bearing the wind blows <em>from</em>.</div>
 <script>
 const STORE = __DATA__;
+if (typeof Plotly === "undefined") {
+  document.getElementById("chart").textContent = "Chart library failed to load.";
+  throw new Error("Plotly missing");
+}
 const times = Object.keys(STORE.readings).sort();
 const ids = Object.keys(STORE.stations).sort((a,b) => STORE.stations[a].name.localeCompare(STORE.stations[b].name));
 const COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
@@ -262,12 +266,12 @@ function layout() {
   const ax = extra => ({ gridcolor: grid, zerolinecolor: grid, linecolor: grid, ...extra });
   return {
     paper_bgcolor: css("--bg"), plot_bgcolor: css("--bg"), font,
-    margin: { l: 60, r: 20, t: 10, b: 40 },
+    margin: { l: 70, r: 20, t: 10, b: 40 },
     grid: { rows: 2, columns: 1, pattern: "independent", roworder: "top to bottom" },
     xaxis:  ax({ type: "date", anchor: "y",  domain: [0, 1], matches: "x2", showticklabels: false }),
     xaxis2: ax({ type: "date", anchor: "y2", domain: [0, 1], tickformat: "%H:%M<br>%d %b", rangeslider: { visible: false } }),
-    yaxis:  ax({ title: "Wind speed (km/h)", domain: [0.54, 1], rangemode: "tozero", fixedrange: false }),
-    yaxis2: ax({ title: "Direction (° from)", domain: [0, 0.46], range: [0, 360],
+    yaxis:  ax({ automargin: true, title: { text: "Wind speed (km/h)", standoff: 8 }, domain: [0.54, 1], rangemode: "tozero", fixedrange: false }),
+    yaxis2: ax({ automargin: true, title: { text: "Direction (° from)", standoff: 8 }, domain: [0, 0.46], range: [0, 360],
                  tickmode: "array", tickvals: [0, 90, 180, 270, 360],
                  ticktext: ["N 0°", "E 90°", "S 180°", "W 270°", "N 360°"] }),
     hovermode: "closest", dragmode: "zoom",
@@ -302,7 +306,9 @@ document.getElementById("sub").textContent =
 def render(store):
     DOCS.mkdir(exist_ok=True)
     payload = json.dumps(store, separators=(",", ":")).replace("</", "<\\/")
-    (DOCS / "index.html").write_text(HTML.replace("__DATA__", payload), encoding="utf-8")
+    plotly = (Path(__file__).parent / "vendor" / "plotly-basic.min.js").read_text(encoding="utf-8")
+    html = HTML.replace("__DATA__", payload).replace("__PLOTLY__", plotly)
+    (DOCS / "index.html").write_text(html, encoding="utf-8")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
