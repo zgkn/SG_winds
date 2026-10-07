@@ -211,6 +211,9 @@ HTML = """<!doctype html>
   header { padding:14px 16px 4px; }
   h1 { margin:0 0 4px; font-size:20px; }
   .sub { color:var(--muted); font-size:13px; }
+  .lockbar { padding:6px 16px 0; }
+  .lockbar button { width:100%; }
+  .lockbar button.unlocked { background:var(--fg); color:var(--bg); }
   #chart { width:100%; height:max(480px, calc(100vh - 230px)); }
   .panel { margin:0 16px 12px; border:1px solid var(--line); border-radius:8px; background:var(--panel); }
   summary { padding:10px 12px; cursor:pointer; font-weight:600; }
@@ -246,6 +249,7 @@ HTML = """<!doctype html>
   <h1>Singapore wind &ndash; past 24 hours</h1>
   <div class="sub" id="sub"></div>
 </header>
+<div class="lockbar" id="lockbar" hidden><button id="lock" type="button"></button></div>
 <div id="chart"></div>
 <details class="panel" id="stationPanel" open>
   <summary>Stations</summary>
@@ -273,6 +277,7 @@ const sgt = t => t.replace("T", " ");   // stored as SGT wall-clock
 const palette = ids.map((_, i) => `hsl(${(i * 137.5) % 360} 65% 48%)`);
 const touch = matchMedia("(pointer: coarse)").matches;
 const narrow = () => innerWidth <= 640;
+let unlocked = false;   // touch only: chart gestures are off until unlocked so the page can scroll
 
 const speedTraces = [], dirTraces = [];
 ids.forEach((id, i) => {
@@ -341,7 +346,7 @@ function adaptive() {
     "yaxis2.ticktext": n ? ["N", "E", "S", "W", "N"] : ["N 0°", "E 90°", "S 180°", "W 270°", "N 360°"],
     "xaxis2.tickformat": n ? "%H:%M" : "%H:%M<br>%d %b",
     "xaxis2.nticks": n ? 5 : 10,
-    dragmode: touch ? "pan" : "zoom",
+    dragmode: touch ? (unlocked ? "pan" : false) : "zoom",
     annotations: [note(1, "Wind speed (km/h)"), note(0.455, "Wind direction, degrees the wind comes from")],
   };
 }
@@ -354,7 +359,7 @@ const base = {
   yaxis2: { domain: [0, 0.43], range: [0, 360], tickmode: "array", tickvals: [0, 90, 180, 270, 360] },
   hovermode: "closest", hoverdistance: 30, showlegend: false,
 };
-const config = { responsive: true, displaylogo: false, scrollZoom: !touch, displayModeBar: true,
+const config = { responsive: true, displaylogo: false, scrollZoom: !touch, displayModeBar: !touch,
                  modeBarButtonsToRemove: ["lasso2d", "select2d", "autoScale2d"] };
 const el = document.getElementById("chart");
 const initial = adaptive();
@@ -363,6 +368,17 @@ for (const [k, v] of Object.entries(initial)) if (k.includes(".")) {
   const [o, f] = k.split("."); layoutInit[o] = { ...(layoutInit[o] || {}), [f]: v };
 }
 Plotly.newPlot(el, [...speedTraces, ...dirTraces, ...avgSpeedTraces, ...avgDirTraces], layoutInit, config);
+
+if (touch) {
+  const lb = document.getElementById("lock"), bar = document.getElementById("lockbar");
+  bar.hidden = false;
+  const label = () => {
+    lb.textContent = unlocked ? "Chart unlocked: drag/pinch to zoom. Tap to lock and scroll" : "Tap to unlock chart zoom and pan";
+    lb.classList.toggle("unlocked", unlocked);
+  };
+  label();
+  lb.onclick = () => { unlocked = !unlocked; label(); Plotly.relayout(el, { dragmode: unlocked ? "pan" : false }); };
+}
 
 let timer;
 const refresh = () => { clearTimeout(timer); timer = setTimeout(() => Plotly.relayout(el, adaptive()), 150); };
@@ -417,7 +433,7 @@ document.getElementById("reset").onclick = () =>
 if (narrow()) document.getElementById("stationPanel").open = false;
 
 document.getElementById("hint").innerHTML = touch
-  ? "Pinch or drag to zoom and pan; tap a line or dot for exact values. Thick lines and diamonds are each region's vector-mean wind. Speed in km/h; direction is the bearing the wind blows <em>from</em>."
+  ? "Swipe scrolls the page. Unlock the chart to pinch or drag to zoom and pan; tap a line or dot for exact values. Thick lines and diamonds are each region's vector-mean wind. Speed in km/h; direction is the bearing the wind blows <em>from</em>."
   : "Drag to zoom, scroll to zoom, shift+drag to pan, double-click to reset. Thick lines and diamonds are the vector-mean wind of each region. Hover for exact values. Speed in km/h; direction is the bearing the wind blows <em>from</em>.";
 
 const have = times.filter(t => Object.keys(STORE.readings[t].s || {}).length).length;
