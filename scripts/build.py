@@ -225,6 +225,7 @@ HTML = """<!doctype html>
   .chip { display:flex; align-items:center; gap:8px; padding:8px 10px; min-height:40px; text-align:left;
           border-radius:20px; font-size:13px; }
   .chip i { width:12px; height:12px; border-radius:50%; flex:none; }
+  .chip.avg { font-weight:600; border-width:2px; }
   .chip.off { opacity:.45; }
   .chip.off i { background:transparent !important; border:2px solid var(--muted); }
   .hint { padding:0 16px 20px; color:var(--muted); font-size:12px; }
@@ -288,6 +289,42 @@ ids.forEach((id, i) => {
     hovertemplate: "<b>%{fullData.name}</b> (" + st.region + ")<br>%{x|%H:%M}<br>%{y}° (%{customdata})<extra></extra>" });
 });
 
+// Vector-mean wind per region and time step: average the u/v components of
+// every station reporting both speed and direction, then convert back.
+const REGION_COLORS = { North: "#d62728", West: "#1f4e9c", Central: "#222222", East: "#e08a00", South: "#0b8f6a" };
+const activeRegions = STORE.regions.filter(r => ids.some(id => STORE.stations[id].region === r));
+const regionAvg = {};
+activeRegions.forEach(r => {
+  const members = ids.filter(id => STORE.stations[id].region === r);
+  const sp = [], dr = [], cnt = [];
+  times.forEach(t => {
+    const S = STORE.readings[t].s || {}, D = STORE.readings[t].d || {};
+    let u = 0, v = 0, n = 0;
+    members.forEach(id => {
+      if (S[id] == null || D[id] == null) return;
+      const rad = D[id] * Math.PI / 180;
+      u += -S[id] * Math.sin(rad); v += -S[id] * Math.cos(rad); n++;
+    });
+    if (!n) { sp.push(null); dr.push(null); cnt.push(0); return; }
+    u /= n; v /= n;
+    sp.push(Math.round(Math.hypot(u, v) * 10) / 10);
+    dr.push(Math.round((Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360) % 360);
+    cnt.push(n);
+  });
+  regionAvg[r] = { sp, dr, cnt };
+});
+const avgSpeedTraces = activeRegions.map(r => ({
+  name: r + " average", showlegend: false, x: times, y: regionAvg[r].sp, customdata: regionAvg[r].cnt,
+  type: "scatter", mode: "lines", connectgaps: false, xaxis: "x", yaxis: "y",
+  line: { color: REGION_COLORS[r], width: 3.5 },
+  hovertemplate: "<b>" + r + " average</b> (vector mean of %{customdata} stations)<br>%{x|%H:%M}<br>%{y:.1f} km/h<extra></extra>" }));
+const avgDirTraces = activeRegions.map(r => ({
+  name: r + " average", showlegend: false, x: times, y: regionAvg[r].dr,
+  customdata: regionAvg[r].dr.map((d, k) => d == null ? "" : compass(d) + " · " + regionAvg[r].cnt[k] + " stn"),
+  type: "scatter", mode: "markers", xaxis: "x2", yaxis: "y2",
+  marker: { color: REGION_COLORS[r], size: 8, symbol: "diamond", line: { color: "#fff", width: 1 } },
+  hovertemplate: "<b>" + r + " average</b><br>%{x|%H:%M}<br>%{y}° (%{customdata})<extra></extra>" }));
+
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 // Settings that depend on viewport width or colour scheme; safe to re-apply
 // without disturbing the user's zoom.
@@ -325,7 +362,7 @@ const layoutInit = { ...base, ...Object.fromEntries(Object.entries(initial).filt
 for (const [k, v] of Object.entries(initial)) if (k.includes(".")) {
   const [o, f] = k.split("."); layoutInit[o] = { ...(layoutInit[o] || {}), [f]: v };
 }
-Plotly.newPlot(el, [...speedTraces, ...dirTraces], layoutInit, config);
+Plotly.newPlot(el, [...speedTraces, ...dirTraces, ...avgSpeedTraces, ...avgDirTraces], layoutInit, config);
 
 let timer;
 const refresh = () => { clearTimeout(timer); timer = setTimeout(() => Plotly.relayout(el, adaptive()), 150); };
@@ -334,6 +371,8 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", refresh);
 
 // Station chips (replace the Plotly legend, which does not fit on phones).
 const on = ids.map(() => true);
+const avgOn = activeRegions.map(() => true);
+const avgEls = [];
 const chips = document.getElementById("chips");
 const chipEls = [];
 STORE.regions.forEach(region => {
@@ -343,11 +382,18 @@ STORE.regions.forEach(region => {
   const head = document.createElement("div"); head.className = "ghead";
   head.innerHTML = `<h3>${region} <span style="color:var(--muted);font-weight:400">(${members.length})</span></h3>`;
   const only = document.createElement("button"); only.type = "button"; only.textContent = "Only";
-  only.onclick = () => { on.fill(false); members.forEach(i => on[i] = true); apply(); };
+  only.onclick = () => { on.fill(false); avgOn.fill(false); members.forEach(i => on[i] = true);
+    avgOn[activeRegions.indexOf(region)] = true; apply(); };
   const tog = document.createElement("button"); tog.type = "button"; tog.textContent = "Toggle";
   tog.onclick = () => { const all = members.every(i => on[i]); members.forEach(i => on[i] = !all); apply(); };
   head.append(only, tog);
   const grid = document.createElement("div"); grid.className = "chips";
+  const ai = activeRegions.indexOf(region);
+  const ab = document.createElement("button");
+  ab.className = "chip avg"; ab.type = "button";
+  ab.innerHTML = `<i style="background:${REGION_COLORS[region]}"></i><span>${region} average (vector mean)</span>`;
+  ab.onclick = () => { avgOn[ai] = !avgOn[ai]; apply(); };
+  grid.appendChild(ab); avgEls[ai] = ab;
   members.forEach(i => {
     const b = document.createElement("button");
     b.className = "chip"; b.type = "button";
@@ -360,18 +406,19 @@ STORE.regions.forEach(region => {
 });
 function apply() {
   chipEls.forEach((b, i) => b.classList.toggle("off", !on[i]));
-  const vis = [...on, ...on];
+  avgEls.forEach((b, i) => b.classList.toggle("off", !avgOn[i]));
+  const vis = [...on, ...on, ...avgOn, ...avgOn];
   Plotly.restyle(el, { visible: vis });
 }
-document.getElementById("all").onclick  = () => { on.fill(true);  apply(); };
-document.getElementById("none").onclick = () => { on.fill(false); apply(); };
+document.getElementById("all").onclick  = () => { on.fill(true);  avgOn.fill(true);  apply(); };
+document.getElementById("none").onclick = () => { on.fill(false); avgOn.fill(false); apply(); };
 document.getElementById("reset").onclick = () =>
   Plotly.relayout(el, { "xaxis.autorange": true, "xaxis2.autorange": true, "yaxis.autorange": true, "yaxis2.range": [0, 360] });
 if (narrow()) document.getElementById("stationPanel").open = false;
 
 document.getElementById("hint").innerHTML = touch
-  ? "Pinch or drag to zoom and pan; tap a line or dot for exact values. Speed in km/h; direction is the bearing the wind blows <em>from</em>."
-  : "Drag to zoom, scroll to zoom, shift+drag to pan, double-click to reset. Hover for exact values. Speed in km/h; direction is the bearing the wind blows <em>from</em>.";
+  ? "Pinch or drag to zoom and pan; tap a line or dot for exact values. Thick lines and diamonds are each region's vector-mean wind. Speed in km/h; direction is the bearing the wind blows <em>from</em>."
+  : "Drag to zoom, scroll to zoom, shift+drag to pan, double-click to reset. Thick lines and diamonds are the vector-mean wind of each region. Hover for exact values. Speed in km/h; direction is the bearing the wind blows <em>from</em>.";
 
 const have = times.filter(t => Object.keys(STORE.readings[t].s || {}).length).length;
 document.getElementById("sub").textContent =
