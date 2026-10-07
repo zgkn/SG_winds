@@ -1,6 +1,6 @@
 """
 build.py — Maintain a rolling 24h store of NEA wind data and render an
-interactive chart.
+interactive SVG chart (same pan/zoom engine as the AQ dashboard).
 
 Each run:
   1. loads data/wind.json (the persistent store, committed to the repo)
@@ -193,315 +193,609 @@ def update(store, now):
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 
-HTML = """<!doctype html>
+HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Singapore Wind – Past 24 Hours</title>
-<script>__PLOTLY__</script>
 <style>
-  :root { --bg:#fff; --fg:#1f2328; --muted:#59636e; --line:#d0d7de; --panel:#f6f8fa; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#0d1117; --fg:#e6edf3; --muted:#9198a1; --line:#30363d; --panel:#161b22; }
+  :root {
+    color-scheme: light;
+    --bg: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --muted: #52514e;
+    --faint: #898781; --grid: #e1e0d9; --border: rgba(11,11,11,0.10);
   }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg);
-         font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-  header { padding:14px 16px 4px; }
-  h1 { margin:0 0 4px; font-size:20px; }
-  .sub { color:var(--muted); font-size:13px; }
-  .zoombar { padding:6px 16px 0; display:flex; gap:6px; }
-  .zoombar button { flex:1; padding:8px 0; font-weight:600; }
-  .zoombar button.active { background:var(--fg); color:var(--bg); }
-  .lockbar { padding:6px 16px 0; }
-  .lockbar button { width:100%; }
-  .lockbar button.unlocked { background:var(--fg); color:var(--bg); }
-  #chart { width:100%; height:max(480px, calc(100vh - 230px)); }
-  .panel { margin:0 16px 12px; border:1px solid var(--line); border-radius:8px; background:var(--panel); }
-  summary { padding:10px 12px; cursor:pointer; font-weight:600; }
-  .bar { padding:0 12px 8px; display:flex; gap:8px; flex-wrap:wrap; }
-  button { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px;
-           padding:8px 12px; cursor:pointer; font:inherit; min-height:36px; }
-  .group { padding:0 12px 10px; }
-  .ghead { display:flex; align-items:center; gap:8px; margin:6px 0; }
-  .ghead h3 { margin:0; font-size:13px; flex:1; }
-  .ghead button { min-height:30px; padding:4px 10px; font-size:12px; }
-  .chips { padding:0; display:grid; gap:6px; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); }
-  .chip { display:flex; align-items:center; gap:8px; padding:8px 10px; min-height:40px; text-align:left;
-          border-radius:20px; font-size:13px; }
-  .chip i { width:12px; height:12px; border-radius:50%; flex:none; }
-  .chip.avg { font-weight:600; border-width:2px; }
-  .chip.off { opacity:.45; }
-  .chip.off i { background:transparent !important; border:2px solid var(--muted); }
-  .hint { padding:0 16px 20px; color:var(--muted); font-size:12px; }
-  @media (max-width:640px) {
-    header { padding:10px 12px 2px; }
-    h1 { font-size:18px; }
-    #chart { height:max(420px, 72vh); }
-    .panel { margin:0 8px 10px; }
-    .zoombar, .lockbar { padding-left:8px; padding-right:8px; }
-    .chips { grid-template-columns:1fr 1fr; }
-    .group { padding:0 8px 8px; }
-    .chip { font-size:12px; padding:6px 8px; border-radius:10px; }
-    .hint { padding:0 12px 20px; }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --bg: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --muted: #c3c2b7;
+      --faint: #898781; --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 900px; margin: 0 auto; padding: 20px 16px 40px; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 0.9rem; margin: 0 0 12px; }
+  button { font: inherit; font-size: 0.8rem; padding: 6px 10px; border-radius: 6px;
+           border: 1px solid var(--border); background: var(--surface); color: var(--ink); cursor: pointer; }
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px;
+             font-size: 0.8rem; color: var(--muted); }
+  .toolbar .spacer { flex: 1; }
+  .chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+                padding: 10px 12px 4px; }
+  .panel-title { font-size: 0.85rem; color: var(--muted); text-align: center; margin: 2px 0 4px; }
+  svg.chart { width: 100%; height: auto; display: block; touch-action: pan-y; cursor: grab;
+              user-select: none; -webkit-user-select: none; }
+  svg.chart.dragging { cursor: grabbing; }
+  .axis-label { font-size: 10px; fill: var(--faint); }
+  .tooltip { position: fixed; pointer-events: none; background: var(--ink); color: var(--bg);
+             font-size: 0.78rem; padding: 6px 9px; border-radius: 6px; line-height: 1.5;
+             z-index: 20; white-space: nowrap; }
+  .tooltip .row { display: flex; gap: 10px; justify-content: space-between; }
+  .tooltip .row .k { opacity: 0.85; }
+  .tooltip .row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tooltip .sep { border-top: 1px solid currentColor; opacity: 0.3; margin: 3px 0; }
+  .panel { margin-top: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+  summary { padding: 10px 12px; cursor: pointer; font-weight: 600; }
+  .bar { padding: 0 12px 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .group { padding: 0 12px 10px; }
+  .ghead { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .ghead h3 { margin: 0; font-size: 13px; flex: 1; }
+  .ghead button { padding: 3px 9px; font-size: 12px; }
+  .chips { display: grid; gap: 6px; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); }
+  .chip { display: flex; align-items: center; gap: 8px; padding: 8px 10px; min-height: 38px;
+          text-align: left; border-radius: 20px; font-size: 13px; }
+  .chip i { width: 12px; height: 12px; border-radius: 50%; flex: none; }
+  .chip.avg { font-weight: 600; border-width: 2px; }
+  .chip.off { opacity: .45; }
+  .chip.off i { background: transparent !important; border: 2px solid var(--faint); }
+  .hint { margin-top: 12px; color: var(--muted); font-size: 0.78rem; line-height: 1.5; }
+  .empty-state { color: var(--muted); font-size: 0.9rem; padding: 24px 0; text-align: center; }
+  @media (max-width: 640px) {
+    main { padding: 12px 8px 30px; }
+    h1 { font-size: 1.2rem; }
+    .chips { grid-template-columns: 1fr 1fr; }
+    .chip { font-size: 12px; padding: 6px 8px; border-radius: 10px; }
+    .group { padding: 0 8px 8px; }
   }
 </style>
 </head>
 <body>
-<header>
-  <h1>Singapore wind &ndash; past 24 hours</h1>
-  <div class="sub" id="sub"></div>
-</header>
-<div class="zoombar">
-  <button id="zout" type="button" aria-label="Zoom out">&minus;</button>
-  <button id="zin" type="button" aria-label="Zoom in">+</button>
-  <button data-hours="3" type="button">3h</button>
-  <button data-hours="6" type="button">6h</button>
-  <button data-hours="12" type="button">12h</button>
-  <button data-hours="24" type="button">24h</button>
-</div>
-<div class="lockbar" id="lockbar" hidden><button id="lock" type="button"></button></div>
-<div id="chart"></div>
-<details class="panel" id="stationPanel" open>
-  <summary>Stations</summary>
-  <div class="bar">
-    <button id="all">Show all</button>
-    <button id="none">Hide all</button>
-    <button id="reset">Reset zoom</button>
+<main>
+  <header>
+    <div>
+      <h1>Singapore wind &ndash; past 24 hours</h1>
+      <p class="subtitle" id="subtitle"></p>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <button id="zout" type="button" aria-label="Zoom out">&minus;</button>
+    <button id="zin" type="button" aria-label="Zoom in">+</button>
+    <button data-hours="3" type="button">3h</button>
+    <button data-hours="6" type="button">6h</button>
+    <button data-hours="12" type="button">12h</button>
+    <button data-hours="24" type="button">24h</button>
+    <span class="spacer"></span>
+    <button id="reset" type="button">Reset view</button>
   </div>
-  <div id="chips"></div>
-</details>
-<div class="hint" id="hint"></div>
+
+  <div class="chart-card" id="card">
+    <div class="panel-title">Wind speed (km/h) &mdash; thick lines are each region's vector-mean wind</div>
+    <svg class="chart" id="chart-speed"></svg>
+    <div class="panel-title">Wind direction (&deg;, the bearing the wind blows from)</div>
+    <svg class="chart" id="chart-dir"></svg>
+  </div>
+
+  <details class="panel" id="stationPanel" open>
+    <summary>Stations</summary>
+    <div class="bar">
+      <button id="all" type="button">Show all</button>
+      <button id="none" type="button">Hide all</button>
+    </div>
+    <div id="chips"></div>
+  </details>
+
+  <div class="hint" id="hint"></div>
+</main>
+
+<div class="tooltip" id="tooltip" hidden></div>
+
 <script>
-const STORE = __DATA__;
-if (typeof Plotly === "undefined") {
-  document.getElementById("chart").textContent = "Chart library failed to load.";
-  throw new Error("Plotly missing");
-}
-const times = Object.keys(STORE.readings).sort();
-const rank = id => STORE.regions.indexOf(STORE.stations[id].region);
-const ids = Object.keys(STORE.stations).sort((a,b) =>
-  rank(a) - rank(b) || STORE.stations[a].name.localeCompare(STORE.stations[b].name));
-const COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
-const compass = d => COMPASS[Math.round(d / 22.5) % 16];
-const sgt = t => t.replace("T", " ");   // stored as SGT wall-clock
-const palette = ids.map((_, i) => `hsl(${(i * 137.5) % 360} 65% 48%)`);
-const touch = matchMedia("(pointer: coarse)").matches;
-const narrow = () => innerWidth <= 640;
-let unlocked = false;   // touch only: chart gestures are off until unlocked so the page can scroll
+(function () {
+  "use strict";
 
-const speedTraces = [], dirTraces = [];
-ids.forEach((id, i) => {
-  const st = STORE.stations[id];
-  const sp = times.map(t => (STORE.readings[t].s || {})[id] ?? null);
-  const dr = times.map(t => (STORE.readings[t].d || {})[id] ?? null);
-  const common = { name: st.name, showlegend: false, hoverlabel: { namelength: -1 } };
-  speedTraces.push({ ...common, x: times, y: sp, type: "scatter", mode: "lines",
-    connectgaps: false, line: { color: palette[i], width: 1.6 }, xaxis: "x", yaxis: "y",
-    hovertemplate: "<b>%{fullData.name}</b> (" + st.region + ")<br>%{x|%H:%M}<br>%{y:.1f} km/h<extra></extra>" });
-  dirTraces.push({ ...common, x: times, y: dr, type: "scatter", mode: "markers",
-    marker: { color: palette[i], size: 5 }, xaxis: "x2", yaxis: "y2",
-    customdata: dr.map(d => d == null ? "" : compass(d)),
-    hovertemplate: "<b>%{fullData.name}</b> (" + st.region + ")<br>%{x|%H:%M}<br>%{y}° (%{customdata})<extra></extra>" });
-});
+  var STORE = __DATA__;
+  var COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+  var REGION_COLORS = { North: "#d62728", West: "#1f4e9c", Central: "#8e24aa", East: "#e08a00", South: "#0b8f6a" };
+  var MARGIN = { top: 10, right: 12, bottom: 6, left: 44 };
+  var BOTTOM_AXIS_H = 28;
+  var H_SPEED = 250, H_DIR = 230;
+  var MIN_SPAN_MS = 20 * 60 * 1000;
+  var TAP_MAX_MOVE_PX = 8;
+  var MIN_PX_PER_TICK = 62;
+  var STEP_CANDIDATES_MS = [5, 10, 15, 30, 60, 120, 180, 360, 720, 1440].map(function (m) { return m * 60000; });
+  var DAY_MS = 86400000;
 
-// Vector-mean wind per region and time step: average the u/v components of
-// every station reporting both speed and direction, then convert back.
-const REGION_COLORS = { North: "#d62728", West: "#1f4e9c", Central: "#8e24aa", East: "#e08a00", South: "#0b8f6a" };
-const activeRegions = STORE.regions.filter(r => ids.some(id => STORE.stations[id].region === r));
-const regionAvg = {};
-activeRegions.forEach(r => {
-  const members = ids.filter(id => STORE.stations[id].region === r);
-  const sp = [], dr = [], cnt = [];
-  times.forEach(t => {
-    const S = STORE.readings[t].s || {}, D = STORE.readings[t].d || {};
-    let u = 0, v = 0, n = 0;
-    members.forEach(id => {
-      if (S[id] == null || D[id] == null) return;
-      const rad = D[id] * Math.PI / 180;
-      u += -S[id] * Math.sin(rad); v += -S[id] * Math.cos(rad); n++;
-    });
-    if (!n) { sp.push(null); dr.push(null); cnt.push(0); return; }
-    u /= n; v /= n;
-    sp.push(Math.round(Math.hypot(u, v) * 10) / 10);
-    dr.push(Math.round((Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360) % 360);
-    cnt.push(n);
-  });
-  regionAvg[r] = { sp, dr, cnt };
-});
-const avgSpeedTraces = activeRegions.map(r => ({
-  name: r + " average", showlegend: false, x: times, y: regionAvg[r].sp, customdata: regionAvg[r].cnt,
-  type: "scatter", mode: "lines", connectgaps: false, xaxis: "x", yaxis: "y",
-  line: { color: REGION_COLORS[r], width: 3.5 },
-  hovertemplate: "<b>" + r + " average</b> (vector mean of %{customdata} stations)<br>%{x|%H:%M}<br>%{y:.1f} km/h<extra></extra>" }));
-const avgDirTraces = activeRegions.map(r => ({
-  name: r + " average", showlegend: false, x: times, y: regionAvg[r].dr,
-  customdata: regionAvg[r].dr.map((d, k) => d == null ? "" : compass(d) + " · " + regionAvg[r].cnt[k] + " stn"),
-  type: "scatter", mode: "markers", xaxis: "x2", yaxis: "y2",
-  marker: { color: REGION_COLORS[r], size: 8, symbol: "diamond", line: { color: "#fff", width: 1 } },
-  hovertemplate: "<b>" + r + " average</b><br>%{x|%H:%M}<br>%{y}° (%{customdata})<extra></extra>" }));
-
-const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-// Settings that depend on viewport width or colour scheme; safe to re-apply
-// without disturbing the user's zoom.
-function adaptive() {
-  const n = narrow(), fg = css("--fg"), grid = css("--line");
-  const note = (y, text) => ({ xref: "paper", yref: "paper", x: 0, y, xanchor: "left", yanchor: "bottom",
-    showarrow: false, text, font: { size: n ? 11 : 12, color: css("--muted") } });
-  return {
-    paper_bgcolor: css("--bg"), plot_bgcolor: css("--bg"),
-    "font.color": fg, "font.size": n ? 10 : 12,
-    "xaxis.gridcolor": grid, "xaxis2.gridcolor": grid, "yaxis.gridcolor": grid, "yaxis2.gridcolor": grid,
-    "yaxis.linecolor": grid, "yaxis2.linecolor": grid, "xaxis2.linecolor": grid,
-    margin: n ? { l: 34, r: 8, t: 24, b: 38 } : { l: 56, r: 20, t: 24, b: 44 },
-    "yaxis2.ticktext": n ? ["N", "E", "S", "W", "N"] : ["N 0°", "E 90°", "S 180°", "W 270°", "N 360°"],
-    "xaxis2.tickformat": n ? "%H:%M" : "%H:%M<br>%d %b",
-    "xaxis2.nticks": n ? 5 : 10,
-    dragmode: touch ? (unlocked ? "pan" : false) : "zoom",
-    annotations: [note(1, "Wind speed (km/h)"), note(0.455, "Wind direction, degrees the wind comes from")],
-  };
-}
-const base = {
-  margin: {},
-  grid: { rows: 2, columns: 1, pattern: "independent", roworder: "top to bottom" },
-  xaxis:  { type: "date", anchor: "y",  domain: [0, 1], matches: "x2", showticklabels: false },
-  xaxis2: { type: "date", anchor: "y2", domain: [0, 1], rangeslider: { visible: false } },
-  yaxis:  { domain: [0.54, 1], rangemode: "tozero" },
-  yaxis2: { domain: [0, 0.43], range: [0, 360], tickmode: "array", tickvals: [0, 90, 180, 270, 360] },
-  hovermode: "closest", hoverdistance: 30, showlegend: false,
-};
-const config = { responsive: true, displaylogo: false, scrollZoom: !touch, displayModeBar: !touch,
-                 modeBarButtonsToRemove: ["lasso2d", "select2d", "autoScale2d"] };
-const el = document.getElementById("chart");
-const initial = adaptive();
-const layoutInit = { ...base, ...Object.fromEntries(Object.entries(initial).filter(([k]) => !k.includes("."))) };
-for (const [k, v] of Object.entries(initial)) if (k.includes(".")) {
-  const [o, f] = k.split("."); layoutInit[o] = { ...(layoutInit[o] || {}), [f]: v };
-}
-Plotly.newPlot(el, [...speedTraces, ...dirTraces, ...avgSpeedTraces, ...avgDirTraces], layoutInit, config);
-
-if (touch) {
-  const lb = document.getElementById("lock"), bar = document.getElementById("lockbar");
-  bar.hidden = false;
-  const label = () => {
-    lb.textContent = unlocked ? "Chart unlocked: drag to pan. Tap to lock and scroll" : "Tap to unlock dragging the chart sideways";
-    lb.classList.toggle("unlocked", unlocked);
-  };
-  label();
-  lb.onclick = () => { unlocked = !unlocked; label(); Plotly.relayout(el, { dragmode: unlocked ? "pan" : false }); };
-}
-
-
-// ── Zoom controls (work on touch, where drag-zoom and pinch are unavailable) ──
-const toMs = str => Date.parse(str.replace(" ", "T").slice(0, 23) + "Z");
-const toStr = ms => new Date(ms).toISOString().slice(0, 23).replace("T", " ");
-const tMin = times.length ? toMs(times[0]) : 0, tMax = times.length ? toMs(times[times.length - 1]) : 0;
-const MIN_SPAN = 20 * 60e3, FULL = Math.max(tMax - tMin, MIN_SPAN);
-let fitting = false;
-function setRange(a, b) {
-  const span = Math.min(Math.max(b - a, MIN_SPAN), FULL * 1.02);
-  let lo = (a + b) / 2 - span / 2;
-  lo = Math.min(Math.max(lo, tMin - FULL * 0.01), tMax + FULL * 0.01 - span);
-  Plotly.relayout(el, { "xaxis2.range": [toStr(lo), toStr(lo + span)] });
-}
-function curRange() { return el._fullLayout.xaxis2.range.map(toMs); }
-function zoomBy(f) { const [a, b] = curRange(), c = (a + b) / 2; setRange(c - (c - a) * f, c + (b - c) * f); }
-document.getElementById("zin").onclick  = () => zoomBy(0.5);
-document.getElementById("zout").onclick = () => zoomBy(2);
-document.querySelectorAll(".zoombar [data-hours]").forEach(b => b.onclick = () => {
-  const h = +b.dataset.hours;
-  if (h >= 24) { Plotly.relayout(el, { "xaxis2.autorange": true }); return; }
-  setRange(tMax - h * 3600e3, tMax + FULL * 0.01);
-});
-
-// Rescale the speed axis to the visible time window and visible traces.
-function fitY() {
-  if (fitting || !times.length) return;
-  const [a, b] = curRange();
-  let max = 0;
-  const visibleIdx = [...on.map((v, i) => v ? i : -1), ...avgOn.map((v, i) => v ? ids.length * 2 + i : -1)].filter(i => i >= 0);
-  const data = el.data;
-  visibleIdx.forEach(i => data[i].y.forEach((y, k) => {
-    if (y == null) return;
-    const t = toMs(times[k]);
-    if (t >= a && t <= b && y > max) max = y;
-  }));
-  if (!max) return;
-  fitting = true;
-  Plotly.relayout(el, { "yaxis.range": [0, Math.ceil(max * 1.1)] }).then(() => { fitting = false; }, () => { fitting = false; });
-}
-el.on("plotly_relayout", ev => {
-  if (fitting) return;
-  const keys = Object.keys(ev);
-  if (keys.some(k => k.startsWith("xaxis2.range") || k === "xaxis2.autorange" || k === "xaxis.autorange")) {
-    if (keys.includes("xaxis2.autorange") || keys.includes("xaxis.autorange")) {
-      fitting = true;
-      Plotly.relayout(el, { "yaxis.autorange": true }).then(() => { fitting = false; }, () => { fitting = false; });
-    } else fitY();
+  // Readings are stored as SGT wall-clock strings; parse them as UTC and
+  // format with timeZone "UTC" so the wall-clock time is shown unchanged.
+  function toMs(s) { return Date.parse(s + ":00Z"); }
+  function fmt(ms, opts) {
+    return new Intl.DateTimeFormat("en-GB", Object.assign({ timeZone: "UTC" }, opts)).format(new Date(ms));
   }
-});
+  var fmtHM = function (ms) { return fmt(ms, { hour: "2-digit", minute: "2-digit", hour12: false }); };
+  var fmtDay = function (ms) { return fmt(ms, { day: "numeric", month: "short" }); };
+  var compass = function (d) { return COMPASS[Math.round(d / 22.5) % 16]; };
 
-let timer;
-const refresh = () => { clearTimeout(timer); timer = setTimeout(() => Plotly.relayout(el, adaptive()), 150); };
-addEventListener("resize", refresh);
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", refresh);
+  var els = {};
+  var state = { width: 860, viewDomain: null, fullDomain: null, panels: [], pinned: false };
 
-// Station chips (replace the Plotly legend, which does not fit on phones).
-const on = ids.map(() => true);
-const avgOn = activeRegions.map(() => true);
-const avgEls = [];
-const chips = document.getElementById("chips");
-const chipEls = [];
-STORE.regions.forEach(region => {
-  const members = ids.map((id, i) => i).filter(i => STORE.stations[ids[i]].region === region);
-  if (!members.length) return;
-  const g = document.createElement("div"); g.className = "group";
-  const head = document.createElement("div"); head.className = "ghead";
-  head.innerHTML = `<h3>${region} <span style="color:var(--muted);font-weight:400">(${members.length})</span></h3>`;
-  const only = document.createElement("button"); only.type = "button"; only.textContent = "Only";
-  only.onclick = () => { on.fill(false); avgOn.fill(false); members.forEach(i => on[i] = true);
-    avgOn[activeRegions.indexOf(region)] = true; apply(); };
-  const tog = document.createElement("button"); tog.type = "button"; tog.textContent = "Toggle";
-  tog.onclick = () => { const all = members.every(i => on[i]); members.forEach(i => on[i] = !all); apply(); };
-  head.append(only, tog);
-  const grid = document.createElement("div"); grid.className = "chips";
-  const ai = activeRegions.indexOf(region);
-  const ab = document.createElement("button");
-  ab.className = "chip avg"; ab.type = "button";
-  ab.innerHTML = `<i style="background:${REGION_COLORS[region]}"></i><span>${region} average (vector mean)</span>`;
-  ab.onclick = () => { avgOn[ai] = !avgOn[ai]; apply(); };
-  grid.appendChild(ab); avgEls[ai] = ab;
-  members.forEach(i => {
-    const b = document.createElement("button");
-    b.className = "chip"; b.type = "button";
-    b.innerHTML = `<i style="background:${palette[i]}"></i><span></span>`;
-    b.lastChild.textContent = STORE.stations[ids[i]].name;
-    b.onclick = () => { on[i] = !on[i]; apply(); };
-    grid.appendChild(b); chipEls[i] = b;
+  var times = Object.keys(STORE.readings).sort();
+  var tms = times.map(toMs);
+  var rank = function (id) { return STORE.regions.indexOf(STORE.stations[id].region); };
+  var ids = Object.keys(STORE.stations).sort(function (a, b) {
+    return rank(a) - rank(b) || STORE.stations[a].name.localeCompare(STORE.stations[b].name);
   });
-  g.append(head, grid); chips.appendChild(g);
-});
-function apply() {
-  chipEls.forEach((b, i) => b.classList.toggle("off", !on[i]));
-  avgEls.forEach((b, i) => b.classList.toggle("off", !avgOn[i]));
-  const vis = [...on, ...on, ...avgOn, ...avgOn];
-  Plotly.restyle(el, { visible: vis }).then(fitY);
-}
-document.getElementById("all").onclick  = () => { on.fill(true);  avgOn.fill(true);  apply(); };
-document.getElementById("none").onclick = () => { on.fill(false); avgOn.fill(false); apply(); };
-document.getElementById("reset").onclick = () =>
-  Plotly.relayout(el, { "xaxis.autorange": true, "xaxis2.autorange": true, "yaxis.autorange": true, "yaxis2.range": [0, 360] });
-if (narrow()) document.getElementById("stationPanel").open = false;
 
-document.getElementById("hint").innerHTML = touch
-  ? "Swipe scrolls the page. Zoom with the &minus;/+ and 3h/6h/12h/24h buttons, then unlock the chart to drag it sideways; tap a line or dot for exact values. Thick lines and diamonds are each region's vector-mean wind. Speed in km/h; direction is the bearing the wind blows <em>from</em>."
-  : "Drag to zoom, scroll to zoom, shift+drag to pan, double-click to reset. Thick lines and diamonds are the vector-mean wind of each region. Hover for exact values. Speed in km/h; direction is the bearing the wind blows <em>from</em>.";
+  function readings(t, key, id) { var r = (STORE.readings[t] || {})[key]; return r && r[id] != null ? r[id] : null; }
 
-const have = times.filter(t => Object.keys(STORE.readings[t].s || {}).length).length;
-document.getElementById("sub").textContent =
-  `${ids.length} stations · ${have}/${times.length} slots · ` +
-  (times.length ? `${sgt(times[0])} → ${sgt(times[times.length - 1])} SGT` : "no data yet");
+  var stations = ids.map(function (id, i) {
+    return {
+      id: id, name: STORE.stations[id].name, region: STORE.stations[id].region,
+      color: "hsl(" + ((i * 137.5) % 360) + " 65% 48%)", on: true, isAvg: false,
+      sp: times.map(function (t) { return readings(t, "s", id); }),
+      dr: times.map(function (t) { return readings(t, "d", id); })
+    };
+  });
+
+  // Vector-mean wind per region and time step: average the u/v components of
+  // every station reporting both speed and direction, then convert back.
+  var activeRegions = STORE.regions.filter(function (r) {
+    return ids.some(function (id) { return STORE.stations[id].region === r; });
+  });
+  var averages = activeRegions.map(function (region) {
+    var members = ids.filter(function (id) { return STORE.stations[id].region === region; });
+    var s = { name: region + " average", region: region, color: REGION_COLORS[region], on: true, isAvg: true,
+              sp: [], dr: [], cnt: [] };
+    times.forEach(function (t) {
+      var u = 0, v = 0, n = 0;
+      members.forEach(function (id) {
+        var sp = readings(t, "s", id), d = readings(t, "d", id);
+        if (sp == null || d == null) return;
+        var rad = d * Math.PI / 180;
+        u += -sp * Math.sin(rad); v += -sp * Math.cos(rad); n++;
+      });
+      if (!n) { s.sp.push(null); s.dr.push(null); s.cnt.push(0); return; }
+      u /= n; v /= n;
+      s.sp.push(Math.round(Math.hypot(u, v) * 10) / 10);
+      s.dr.push(Math.round((Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360) % 360);
+      s.cnt.push(n);
+    });
+    return s;
+  });
+  var allSeries = stations.concat(averages);
+
+  document.addEventListener("DOMContentLoaded", init);
+
+  function init() {
+    els.subtitle = document.getElementById("subtitle");
+    els.tooltip = document.getElementById("tooltip");
+    var have = times.filter(function (t) { return Object.keys(STORE.readings[t].s || {}).length; }).length;
+    els.subtitle.textContent = ids.length + " stations · " + have + "/" + times.length + " slots · " +
+      (times.length ? times[0].replace("T", " ") + " → " + times[times.length - 1].replace("T", " ") + " SGT" : "no data yet");
+
+    if (!times.length) {
+      var p = document.createElement("p");
+      p.className = "empty-state"; p.textContent = "No wind data yet.";
+      document.getElementById("card").replaceWith(p);
+      return;
+    }
+
+    state.fullDomain = [tms[0], tms[tms.length - 1]];
+    state.viewDomain = state.fullDomain.slice();
+
+    var touch = matchMedia("(pointer: coarse)").matches;
+    document.getElementById("hint").innerHTML = touch
+      ? "Swipe sideways on a chart to pan, vertically to scroll the page; use the &minus;/+ and 3h/6h/12h/24h buttons to zoom. Tap a point for readings. Speed in km/h; direction is the bearing the wind blows <em>from</em>."
+      : "Drag to pan, scroll or pinch to zoom, click to pin the readings, hover for exact values. Thick lines and dots are the vector-mean wind of each region. Speed in km/h; direction is the bearing the wind blows <em>from</em>.";
+
+    document.getElementById("zin").onclick = function () { zoomBy(0.5); };
+    document.getElementById("zout").onclick = function () { zoomBy(2); };
+    document.getElementById("reset").onclick = resetView;
+    document.querySelectorAll(".toolbar [data-hours]").forEach(function (b) {
+      b.onclick = function () {
+        var h = +b.dataset.hours, hi = state.fullDomain[1];
+        state.viewDomain = clampViewDomain([hi - h * 3600000, hi]);
+        dismissPinned(); renderAll();
+      };
+    });
+    window.addEventListener("resize", debounce(function () { measureWidth(); renderAll(); }, 150));
+    document.addEventListener("pointerdown", function (evt) {
+      if (!state.pinned) return;
+      if (evt.target.closest && evt.target.closest(".chart-card")) return;
+      dismissPinned();
+    });
+
+    buildChips();
+    if (innerWidth <= 640) document.getElementById("stationPanel").open = false;
+    measureWidth();
+    buildPanel("chart-speed", false);
+    buildPanel("chart-dir", true);
+    renderAll();
+  }
+
+  function debounce(fn, ms) {
+    var t;
+    return function () { clearTimeout(t); t = setTimeout(fn, ms); };
+  }
+  function measureWidth() { state.width = Math.max(280, document.getElementById("card").clientWidth - 24); }
+  function dismissPinned() {
+    state.pinned = false; els.tooltip.hidden = true;
+    state.panels.forEach(function (p) { if (p.crosshair) p.crosshair.setAttribute("visibility", "hidden"); });
+  }
+  function resetView() { state.viewDomain = state.fullDomain.slice(); dismissPinned(); renderAll(); }
+
+  function niceTicks(min, max, count) {
+    if (min === max) { min -= 1; max += 1; }
+    var step0 = (max - min) / count;
+    var mag = Math.pow(10, Math.floor(Math.log10(step0)));
+    var residual = step0 / mag;
+    var step = residual > 5 ? 10 * mag : residual > 2 ? 5 * mag : residual > 1 ? 2 * mag : mag;
+    var ticks = [];
+    for (var v = Math.floor(min / step) * step; v <= Math.ceil(max / step) * step + 1e-9; v += step) ticks.push(Math.round(v * 1000) / 1000);
+    return ticks;
+  }
+
+  function timeTicks(domain, innerW) {
+    var span = domain[1] - domain[0];
+    var maxTicks = Math.max(2, Math.floor(innerW / MIN_PX_PER_TICK));
+    var step = STEP_CANDIDATES_MS[STEP_CANDIDATES_MS.length - 1];
+    for (var i = 0; i < STEP_CANDIDATES_MS.length; i++) {
+      if (span / STEP_CANDIDATES_MS[i] <= maxTicks) { step = STEP_CANDIDATES_MS[i]; break; }
+    }
+    var ticks = [];
+    for (var t = Math.ceil(domain[0] / step) * step; t <= domain[1]; t += step) ticks.push(t);
+    return ticks;
+  }
+
+  function scaleLinear(domain, range) {
+    var span = domain[1] - domain[0] || 1;
+    return function (v) { return range[0] + ((v - domain[0]) / span) * (range[1] - range[0]); };
+  }
+  function svgEl(tag, attrs) {
+    var el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (var k in attrs) el.setAttribute(k, attrs[k]);
+    return el;
+  }
+
+  function linePath(vals, x, y) {
+    var d = "", pen = false;
+    for (var i = 0; i < vals.length; i++) {
+      if (vals[i] == null) { pen = false; continue; }
+      d += (pen ? "L" : "M") + x(tms[i]).toFixed(1) + "," + y(vals[i]).toFixed(1) + " ";
+      pen = true;
+    }
+    return d;
+  }
+  // Direction points are drawn as zero-length round-capped segments: one
+  // <path> per series instead of hundreds of <circle> nodes.
+  function dotPath(vals, x, y, lo, hi) {
+    var d = "";
+    for (var i = lo; i <= hi; i++) {
+      if (vals[i] == null) continue;
+      d += "M" + x(tms[i]).toFixed(1) + "," + y(vals[i]).toFixed(1) + "h0";
+    }
+    return d;
+  }
+
+  function visibleRange() {
+    var lo = 0, hi = tms.length - 1;
+    while (lo < tms.length && tms[lo] < state.viewDomain[0]) lo++;
+    while (hi >= 0 && tms[hi] > state.viewDomain[1]) hi--;
+    return [Math.max(0, lo - 1), Math.min(tms.length - 1, hi + 1)];
+  }
+
+  function speedYDomain() {
+    var r = visibleRange(), max = 0;
+    allSeries.forEach(function (s) {
+      if (!s.on) return;
+      for (var i = r[0]; i <= r[1]; i++) if (s.sp[i] != null && s.sp[i] > max) max = s.sp[i];
+    });
+    var ticks = niceTicks(0, Math.max(max * 1.05, 5), 4);
+    return [0, ticks[ticks.length - 1]];
+  }
+
+  function panelInnerH(isDir) { return (isDir ? H_DIR : H_SPEED) - MARGIN.top - MARGIN.bottom - (isDir ? BOTTOM_AXIS_H : 0); }
+
+  function buildPanel(id, isDir) {
+    var svg = document.getElementById(id);
+    var g = svgEl("g");
+    var clipRect = svgEl("rect");
+    var clipPath = svgEl("clipPath", { id: id + "-clip" });
+    var defs = svgEl("defs");
+    clipPath.appendChild(clipRect); defs.appendChild(clipPath);
+    svg.appendChild(g); svg.appendChild(defs);
+    var gridGroup = svgEl("g");
+    var plot = svgEl("g", { "clip-path": "url(#" + id + "-clip)" });
+    var chromeGroup = svgEl("g");
+    g.appendChild(gridGroup); g.appendChild(plot); g.appendChild(chromeGroup);
+    var panel = { svg: svg, g: g, gridGroup: gridGroup, plot: plot, chromeGroup: chromeGroup, clipRect: clipRect, isDir: isDir };
+    state.panels.push(panel);
+    attachInteraction(panel);
+  }
+
+  function renderAll() { state.panels.forEach(renderPanel); }
+
+  function renderPanel(panel) {
+    var W = state.width, H = panel.isDir ? H_DIR : H_SPEED;
+    var innerW = W - MARGIN.left - MARGIN.right, innerH = panelInnerH(panel.isDir);
+    panel.svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    panel.svg.setAttribute("width", W);
+    panel.svg.setAttribute("height", H);
+    panel.g.setAttribute("transform", "translate(" + MARGIN.left + "," + MARGIN.top + ")");
+    panel.clipRect.setAttribute("x", -2); panel.clipRect.setAttribute("y", -4);
+    panel.clipRect.setAttribute("width", innerW + 4); panel.clipRect.setAttribute("height", innerH + 8);
+    panel.gridGroup.innerHTML = ""; panel.plot.innerHTML = ""; panel.chromeGroup.innerHTML = "";
+
+    var x = scaleLinear(state.viewDomain, [0, innerW]);
+    var yDomain = panel.isDir ? [0, 360] : speedYDomain();
+    var y = scaleLinear(yDomain, [innerH, 0]);
+    panel.x = x; panel.y = y; panel.innerW = innerW; panel.innerH = innerH;
+
+    var yTicks = panel.isDir ? [0, 90, 180, 270, 360] : niceTicks(yDomain[0], yDomain[1], 4);
+    var dirLabels = { 0: "N", 90: "E", 180: "S", 270: "W", 360: "N" };
+    yTicks.forEach(function (t) {
+      panel.gridGroup.appendChild(svgEl("line", { x1: 0, x2: innerW, y1: y(t), y2: y(t), stroke: "var(--grid)", "stroke-width": 1 }));
+      var lbl = svgEl("text", { class: "axis-label", x: -6, y: y(t) + 3, "text-anchor": "end" });
+      lbl.textContent = panel.isDir ? dirLabels[t] + " " + t + "°" : Math.round(t);
+      panel.chromeGroup.appendChild(lbl);
+    });
+
+    timeTicks(state.viewDomain, innerW).forEach(function (t) {
+      var xp = x(t);
+      panel.gridGroup.appendChild(svgEl("line", { x1: xp, x2: xp, y1: 0, y2: innerH, stroke: "var(--grid)", "stroke-width": 1 }));
+      if (panel.isDir) {
+        panel.chromeGroup.appendChild(svgEl("line", { x1: xp, x2: xp, y1: innerH, y2: innerH + 4, stroke: "var(--faint)", "stroke-width": 1 }));
+        var midnight = fmtHM(t) === "00:00";
+        var lbl = svgEl("text", { class: "axis-label", x: xp, y: innerH + 15, "text-anchor": "middle" });
+        lbl.textContent = fmtHM(t);
+        panel.chromeGroup.appendChild(lbl);
+        if (midnight) {
+          var d = svgEl("text", { class: "axis-label", x: xp, y: innerH + 26, "text-anchor": "middle" });
+          d.textContent = fmtDay(t);
+          panel.chromeGroup.appendChild(d);
+        }
+      }
+    });
+
+    var r = visibleRange();
+    // Stations first, region averages on top.
+    allSeries.forEach(function (s) {
+      if (!s.on) return;
+      if (panel.isDir) {
+        panel.plot.appendChild(svgEl("path", {
+          d: dotPath(s.dr, x, y, r[0], r[1]), fill: "none", stroke: s.color,
+          "stroke-width": s.isAvg ? 7 : 4, "stroke-linecap": "round", opacity: s.isAvg ? 1 : 0.8
+        }));
+      } else {
+        panel.plot.appendChild(svgEl("path", {
+          d: linePath(s.sp, x, y), fill: "none", stroke: s.color,
+          "stroke-width": s.isAvg ? 3.5 : 1.4, "stroke-linejoin": "round", "stroke-linecap": "round",
+          opacity: s.isAvg ? 1 : 0.85
+        }));
+      }
+    });
+
+    var crosshair = svgEl("line", { x1: -10, x2: -10, y1: 0, y2: innerH, stroke: "var(--faint)", "stroke-width": 1, visibility: "hidden" });
+    panel.chromeGroup.appendChild(crosshair);
+    panel.crosshair = crosshair;
+  }
+
+  function clampViewDomain(domain) {
+    var full = state.fullDomain;
+    var span = Math.max(Math.min(domain[1] - domain[0], full[1] - full[0]), MIN_SPAN_MS);
+    var lo = domain[0], hi = lo + span;
+    if (lo < full[0]) { lo = full[0]; hi = lo + span; }
+    if (hi > full[1]) { hi = full[1]; lo = hi - span; }
+    return [lo, hi];
+  }
+  function localXFromClientX(svg, clientX) {
+    var rect = svg.getBoundingClientRect();
+    return (clientX - rect.left) * (state.width / rect.width) - MARGIN.left;
+  }
+  function localYFromClientY(svg, clientY) {
+    var rect = svg.getBoundingClientRect();
+    return (clientY - rect.top) * (state.width / rect.width) - MARGIN.top;
+  }
+  function zoomAtFrac(frac, factor) {
+    frac = Math.max(0, Math.min(1, frac));
+    var d = state.viewDomain, cursorT = d[0] + frac * (d[1] - d[0]), span = (d[1] - d[0]) * factor;
+    state.viewDomain = clampViewDomain([cursorT - frac * span, cursorT - frac * span + span]);
+    renderAll();
+  }
+  function zoomBy(f) { zoomAtFrac(0.5, f); }
+
+  // Single pointer = pan. Two pointers = pinch-zoom around their midpoint.
+  function attachInteraction(panel) {
+    var svg = panel.svg, pointers = {}, dragState = null, pinchState = null;
+    var activeIds = function () { return Object.keys(pointers); };
+    var dist = function (a, b) { return Math.hypot(pointers[a].x - pointers[b].x, pointers[a].y - pointers[b].y); };
+
+    svg.addEventListener("pointerdown", function (evt) {
+      evt.preventDefault();
+      try { svg.setPointerCapture(evt.pointerId); } catch (e) {}
+      pointers[evt.pointerId] = { x: evt.clientX, y: evt.clientY };
+      var a = activeIds();
+      if (a.length === 2) {
+        dragState = null; pinchState = { ids: a, lastDist: dist(a[0], a[1]) };
+        svg.classList.remove("dragging"); panel.tapStart = null;
+      } else if (a.length === 1) {
+        pinchState = null; svg.classList.add("dragging");
+        dragState = { startX: evt.clientX, startDomain: state.viewDomain.slice() };
+        panel.tapStart = { x: evt.clientX, y: evt.clientY };
+      }
+    });
+
+    svg.addEventListener("pointermove", function (evt) {
+      if (!(evt.pointerId in pointers)) { handleHover(panel, evt); return; }
+      pointers[evt.pointerId] = { x: evt.clientX, y: evt.clientY };
+      if (panel.tapStart && Math.hypot(evt.clientX - panel.tapStart.x, evt.clientY - panel.tapStart.y) > TAP_MAX_MOVE_PX) panel.tapStart = null;
+
+      if (pinchState) {
+        evt.preventDefault();
+        var p = pinchState.ids;
+        if (!(p[0] in pointers) || !(p[1] in pointers)) return;
+        var d = dist(p[0], p[1]);
+        if (pinchState.lastDist > 0 && d > 0) {
+          var mid = (pointers[p[0]].x + pointers[p[1]].x) / 2;
+          zoomAtFrac(localXFromClientX(svg, mid) / panel.innerW, pinchState.lastDist / d);
+        }
+        pinchState.lastDist = d;
+        return;
+      }
+      if (dragState) {
+        evt.preventDefault();
+        var scale = state.width / svg.getBoundingClientRect().width;
+        var dtMs = ((evt.clientX - dragState.startX) * scale) / (panel.innerW / (dragState.startDomain[1] - dragState.startDomain[0]));
+        state.viewDomain = clampViewDomain([dragState.startDomain[0] - dtMs, dragState.startDomain[1] - dtMs]);
+        renderAll();
+        return;
+      }
+      handleHover(panel, evt);
+    });
+
+    function endPointer(evt) {
+      try { svg.releasePointerCapture(evt.pointerId); } catch (e) {}
+      delete pointers[evt.pointerId];
+      var a = activeIds();
+      var wasTap = evt.type === "pointerup" && !pinchState && panel.tapStart && a.length === 0;
+      if (pinchState) {
+        if (a.length < 2) {
+          pinchState = null;
+          if (a.length === 1) { dragState = { startX: pointers[a[0]].x, startDomain: state.viewDomain.slice() }; svg.classList.add("dragging"); }
+          else svg.classList.remove("dragging");
+        }
+      } else if (dragState && a.length === 0) { dragState = null; svg.classList.remove("dragging"); }
+      if (wasTap) { panel.tapStart = null; state.pinned = true; showReadings(panel, evt); }
+    }
+    svg.addEventListener("pointerup", endPointer);
+    svg.addEventListener("pointercancel", endPointer);
+    svg.addEventListener("pointerleave", function () {
+      if (state.pinned) return;
+      state.panels.forEach(function (p) { if (p.crosshair) p.crosshair.setAttribute("visibility", "hidden"); });
+      els.tooltip.hidden = true;
+    });
+    svg.addEventListener("wheel", function (evt) {
+      evt.preventDefault();
+      zoomAtFrac(localXFromClientX(svg, evt.clientX) / panel.innerW, evt.deltaY > 0 ? 1.15 : 1 / 1.15);
+    }, { passive: false });
+  }
+
+  function handleHover(panel, evt) { if (!state.pinned) showReadings(panel, evt); }
+
+  function showReadings(panel, evt) {
+    var lx = Math.max(0, Math.min(panel.innerW, localXFromClientX(panel.svg, evt.clientX)));
+    var d = state.viewDomain, tMs = d[0] + (lx / panel.innerW) * (d[1] - d[0]);
+    var idx = 0, best = Infinity;
+    for (var i = 0; i < tms.length; i++) { var diff = Math.abs(tms[i] - tMs); if (diff < best) { best = diff; idx = i; } }
+
+    state.panels.forEach(function (p) {
+      if (!p.crosshair) return;
+      var cx = p.x(tms[idx]);
+      p.crosshair.setAttribute("x1", cx); p.crosshair.setAttribute("x2", cx);
+      p.crosshair.setAttribute("visibility", "visible");
+    });
+
+    var tip = els.tooltip;
+    tip.innerHTML = "";
+    function row(label, color, value, bold) {
+      var r = document.createElement("div"); r.className = "row";
+      var k = document.createElement("span"); k.className = "k"; k.textContent = label;
+      if (color) k.style.color = color;
+      var v = document.createElement("span"); v.className = "v"; v.textContent = value;
+      r.appendChild(k); r.appendChild(v); tip.appendChild(r);
+    }
+    row("Time", null, fmtDay(tms[idx]) + " " + fmtHM(tms[idx]) + " SGT");
+    var any = false;
+    function reading(s) {
+      var sp = s.sp[idx], dr = s.dr[idx];
+      return (sp == null ? "–" : sp.toFixed(1) + " km/h") + " · " + (dr == null ? "–" : compass(dr) + " " + dr + "°");
+    }
+    averages.forEach(function (s) {
+      if (!s.on) return;
+      any = true; row(s.region + " avg", s.color, reading(s));
+    });
+
+    // Many stations would make the tooltip huge: show just the one whose
+    // line/dot is closest to the pointer in the hovered panel.
+    var ly = localYFromClientY(panel.svg, evt.clientY), near = null, nearD = 24;
+    stations.forEach(function (s) {
+      var v = panel.isDir ? s.dr[idx] : s.sp[idx];
+      if (!s.on || v == null) return;
+      var dy = Math.abs(panel.y(v) - ly);
+      if (dy < nearD) { nearD = dy; near = s; }
+    });
+    if (near) {
+      if (any) { var sep = document.createElement("div"); sep.className = "sep"; tip.appendChild(sep); }
+      any = true; row(near.name + " (" + near.region + ")", near.color, reading(near));
+    }
+    if (!any) { tip.hidden = true; return; }
+
+    tip.hidden = false;
+    var w = tip.offsetWidth || 220, left = evt.clientX + 14;
+    if (left + w > window.innerWidth) left = Math.max(4, evt.clientX - w - 14);
+    tip.style.left = left + "px";
+    tip.style.top = (evt.clientY + 14) + "px";
+  }
+
+  function buildChips() {
+    var chips = document.getElementById("chips");
+    function setAll(v) { allSeries.forEach(function (s) { s.on = v; }); refreshChips(); renderAll(); }
+    document.getElementById("all").onclick = function () { setAll(true); };
+    document.getElementById("none").onclick = function () { setAll(false); };
+
+    function chip(s) {
+      var b = document.createElement("button");
+      b.type = "button"; b.className = "chip" + (s.isAvg ? " avg" : "");
+      var dot = document.createElement("i"); dot.style.background = s.color;
+      var label = document.createElement("span");
+      label.textContent = s.isAvg ? s.region + " average (vector mean)" : s.name;
+      b.appendChild(dot); b.appendChild(label);
+      b.onclick = function () { s.on = !s.on; refreshChips(); renderAll(); };
+      s.chip = b;
+      return b;
+    }
+    STORE.regions.forEach(function (region) {
+      var members = stations.filter(function (s) { return s.region === region; });
+      if (!members.length) return;
+      var avg = averages.filter(function (s) { return s.region === region; })[0];
+      var g = document.createElement("div"); g.className = "group";
+      var head = document.createElement("div"); head.className = "ghead";
+      var h3 = document.createElement("h3");
+      h3.textContent = region + " (" + members.length + ")";
+      var only = document.createElement("button"); only.type = "button"; only.textContent = "Only";
+      only.onclick = function () {
+        allSeries.forEach(function (s) { s.on = false; });
+        members.forEach(function (s) { s.on = true; }); avg.on = true;
+        refreshChips(); renderAll();
+      };
+      var tog = document.createElement("button"); tog.type = "button"; tog.textContent = "Toggle";
+      tog.onclick = function () {
+        var all = members.every(function (s) { return s.on; });
+        members.forEach(function (s) { s.on = !all; }); refreshChips(); renderAll();
+      };
+      head.appendChild(h3); head.appendChild(only); head.appendChild(tog);
+      var grid = document.createElement("div"); grid.className = "chips";
+      grid.appendChild(chip(avg));
+      members.forEach(function (s) { grid.appendChild(chip(s)); });
+      g.appendChild(head); g.appendChild(grid); chips.appendChild(g);
+    });
+  }
+  function refreshChips() { allSeries.forEach(function (s) { if (s.chip) s.chip.classList.toggle("off", !s.on); }); }
+})();
 </script>
 </body>
 </html>
@@ -535,8 +829,7 @@ def render(store):
                                    for sid, info in store["stations"].items()},
              "regions": REGIONS}
     payload = json.dumps(store, separators=(",", ":")).replace("</", "<\\/")
-    plotly = (Path(__file__).parent / "vendor" / "plotly-basic.min.js").read_text(encoding="utf-8")
-    html = HTML.replace("__DATA__", payload).replace("__PLOTLY__", plotly)
+    html = HTML.replace("__DATA__", payload)
     (DOCS / "index.html").write_text(html, encoding="utf-8")
 
 
