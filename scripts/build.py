@@ -211,6 +211,9 @@ HTML = """<!doctype html>
   header { padding:14px 16px 4px; }
   h1 { margin:0 0 4px; font-size:20px; }
   .sub { color:var(--muted); font-size:13px; }
+  .zoombar { padding:6px 16px 0; display:flex; gap:6px; }
+  .zoombar button { flex:1; padding:8px 0; font-weight:600; }
+  .zoombar button.active { background:var(--fg); color:var(--bg); }
   .lockbar { padding:6px 16px 0; }
   .lockbar button { width:100%; }
   .lockbar button.unlocked { background:var(--fg); color:var(--bg); }
@@ -237,6 +240,7 @@ HTML = """<!doctype html>
     h1 { font-size:18px; }
     #chart { height:max(420px, 72vh); }
     .panel { margin:0 8px 10px; }
+    .zoombar, .lockbar { padding-left:8px; padding-right:8px; }
     .chips { grid-template-columns:1fr 1fr; }
     .group { padding:0 8px 8px; }
     .chip { font-size:12px; padding:6px 8px; border-radius:10px; }
@@ -249,6 +253,14 @@ HTML = """<!doctype html>
   <h1>Singapore wind &ndash; past 24 hours</h1>
   <div class="sub" id="sub"></div>
 </header>
+<div class="zoombar">
+  <button id="zout" type="button" aria-label="Zoom out">&minus;</button>
+  <button id="zin" type="button" aria-label="Zoom in">+</button>
+  <button data-hours="3" type="button">3h</button>
+  <button data-hours="6" type="button">6h</button>
+  <button data-hours="12" type="button">12h</button>
+  <button data-hours="24" type="button">24h</button>
+</div>
 <div class="lockbar" id="lockbar" hidden><button id="lock" type="button"></button></div>
 <div id="chart"></div>
 <details class="panel" id="stationPanel" open>
@@ -373,12 +385,62 @@ if (touch) {
   const lb = document.getElementById("lock"), bar = document.getElementById("lockbar");
   bar.hidden = false;
   const label = () => {
-    lb.textContent = unlocked ? "Chart unlocked: drag/pinch to zoom. Tap to lock and scroll" : "Tap to unlock chart zoom and pan";
+    lb.textContent = unlocked ? "Chart unlocked: drag to pan. Tap to lock and scroll" : "Tap to unlock dragging the chart sideways";
     lb.classList.toggle("unlocked", unlocked);
   };
   label();
   lb.onclick = () => { unlocked = !unlocked; label(); Plotly.relayout(el, { dragmode: unlocked ? "pan" : false }); };
 }
+
+
+// ── Zoom controls (work on touch, where drag-zoom and pinch are unavailable) ──
+const toMs = str => Date.parse(str.replace(" ", "T").slice(0, 23) + "Z");
+const toStr = ms => new Date(ms).toISOString().slice(0, 23).replace("T", " ");
+const tMin = times.length ? toMs(times[0]) : 0, tMax = times.length ? toMs(times[times.length - 1]) : 0;
+const MIN_SPAN = 20 * 60e3, FULL = Math.max(tMax - tMin, MIN_SPAN);
+let fitting = false;
+function setRange(a, b) {
+  const span = Math.min(Math.max(b - a, MIN_SPAN), FULL * 1.02);
+  let lo = (a + b) / 2 - span / 2;
+  lo = Math.min(Math.max(lo, tMin - FULL * 0.01), tMax + FULL * 0.01 - span);
+  Plotly.relayout(el, { "xaxis2.range": [toStr(lo), toStr(lo + span)] });
+}
+function curRange() { return el._fullLayout.xaxis2.range.map(toMs); }
+function zoomBy(f) { const [a, b] = curRange(), c = (a + b) / 2; setRange(c - (c - a) * f, c + (b - c) * f); }
+document.getElementById("zin").onclick  = () => zoomBy(0.5);
+document.getElementById("zout").onclick = () => zoomBy(2);
+document.querySelectorAll(".zoombar [data-hours]").forEach(b => b.onclick = () => {
+  const h = +b.dataset.hours;
+  if (h >= 24) { Plotly.relayout(el, { "xaxis2.autorange": true }); return; }
+  setRange(tMax - h * 3600e3, tMax + FULL * 0.01);
+});
+
+// Rescale the speed axis to the visible time window and visible traces.
+function fitY() {
+  if (fitting || !times.length) return;
+  const [a, b] = curRange();
+  let max = 0;
+  const visibleIdx = [...on.map((v, i) => v ? i : -1), ...avgOn.map((v, i) => v ? ids.length * 2 + i : -1)].filter(i => i >= 0);
+  const data = el.data;
+  visibleIdx.forEach(i => data[i].y.forEach((y, k) => {
+    if (y == null) return;
+    const t = toMs(times[k]);
+    if (t >= a && t <= b && y > max) max = y;
+  }));
+  if (!max) return;
+  fitting = true;
+  Plotly.relayout(el, { "yaxis.range": [0, Math.ceil(max * 1.1)] }).then(() => { fitting = false; }, () => { fitting = false; });
+}
+el.on("plotly_relayout", ev => {
+  if (fitting) return;
+  const keys = Object.keys(ev);
+  if (keys.some(k => k.startsWith("xaxis2.range") || k === "xaxis2.autorange" || k === "xaxis.autorange")) {
+    if (keys.includes("xaxis2.autorange") || keys.includes("xaxis.autorange")) {
+      fitting = true;
+      Plotly.relayout(el, { "yaxis.autorange": true }).then(() => { fitting = false; }, () => { fitting = false; });
+    } else fitY();
+  }
+});
 
 let timer;
 const refresh = () => { clearTimeout(timer); timer = setTimeout(() => Plotly.relayout(el, adaptive()), 150); };
@@ -424,7 +486,7 @@ function apply() {
   chipEls.forEach((b, i) => b.classList.toggle("off", !on[i]));
   avgEls.forEach((b, i) => b.classList.toggle("off", !avgOn[i]));
   const vis = [...on, ...on, ...avgOn, ...avgOn];
-  Plotly.restyle(el, { visible: vis });
+  Plotly.restyle(el, { visible: vis }).then(fitY);
 }
 document.getElementById("all").onclick  = () => { on.fill(true);  avgOn.fill(true);  apply(); };
 document.getElementById("none").onclick = () => { on.fill(false); avgOn.fill(false); apply(); };
@@ -433,7 +495,7 @@ document.getElementById("reset").onclick = () =>
 if (narrow()) document.getElementById("stationPanel").open = false;
 
 document.getElementById("hint").innerHTML = touch
-  ? "Swipe scrolls the page. Unlock the chart to pinch or drag to zoom and pan; tap a line or dot for exact values. Thick lines and diamonds are each region's vector-mean wind. Speed in km/h; direction is the bearing the wind blows <em>from</em>."
+  ? "Swipe scrolls the page. Zoom with the &minus;/+ and 3h/6h/12h/24h buttons, then unlock the chart to drag it sideways; tap a line or dot for exact values. Thick lines and diamonds are each region's vector-mean wind. Speed in km/h; direction is the bearing the wind blows <em>from</em>."
   : "Drag to zoom, scroll to zoom, shift+drag to pan, double-click to reset. Thick lines and diamonds are the vector-mean wind of each region. Hover for exact values. Speed in km/h; direction is the bearing the wind blows <em>from</em>.";
 
 const have = times.filter(t => Object.keys(STORE.readings[t].s || {}).length).length;
