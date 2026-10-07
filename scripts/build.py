@@ -296,7 +296,7 @@ ids.forEach((id, i) => {
 
 // Vector-mean wind per region and time step: average the u/v components of
 // every station reporting both speed and direction, then convert back.
-const REGION_COLORS = { North: "#d62728", West: "#1f4e9c", Central: "#222222", East: "#e08a00", South: "#0b8f6a" };
+const REGION_COLORS = { North: "#d62728", West: "#1f4e9c", Central: "#8e24aa", East: "#e08a00", South: "#0b8f6a" };
 const activeRegions = STORE.regions.filter(r => ids.some(id => STORE.stations[id].region === r));
 const regionAvg = {};
 activeRegions.forEach(r => {
