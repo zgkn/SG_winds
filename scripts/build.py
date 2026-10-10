@@ -762,11 +762,25 @@ HTML = r"""<!doctype html>
       b.type = "button"; b.className = "chip" + (s.isAvg ? " avg" : "");
       var dot = document.createElement("i"); dot.style.background = s.color;
       var label = document.createElement("span");
-      label.textContent = s.isAvg ? s.region + " average (vector mean)" : s.name;
+      label.textContent = s.isAvg ? s.region : s.name;
       b.appendChild(dot); b.appendChild(label);
       b.onclick = function () { s.on = !s.on; refreshChips(); renderAll(); };
       s.chip = b;
       return b;
+    }
+    if (averages.length) {
+      var ag = document.createElement("div"); ag.className = "group";
+      var ahead = document.createElement("div"); ahead.className = "ghead";
+      var ah3 = document.createElement("h3"); ah3.textContent = "Region averages (vector mean)";
+      function setAvg(v) { averages.forEach(function (s) { s.on = v; }); refreshChips(); renderAll(); }
+      var aAll = document.createElement("button"); aAll.type = "button"; aAll.textContent = "All";
+      aAll.onclick = function () { setAvg(true); };
+      var aNone = document.createElement("button"); aNone.type = "button"; aNone.textContent = "None";
+      aNone.onclick = function () { setAvg(false); };
+      ahead.appendChild(ah3); ahead.appendChild(aAll); ahead.appendChild(aNone);
+      var agrid = document.createElement("div"); agrid.className = "chips";
+      averages.forEach(function (s) { agrid.appendChild(chip(s)); });
+      ag.appendChild(ahead); ag.appendChild(agrid); chips.appendChild(ag);
     }
     STORE.regions.forEach(function (region) {
       var members = stations.filter(function (s) { return s.region === region; });
@@ -789,7 +803,6 @@ HTML = r"""<!doctype html>
       };
       head.appendChild(h3); head.appendChild(only); head.appendChild(tog);
       var grid = document.createElement("div"); grid.className = "chips";
-      grid.appendChild(chip(avg));
       members.forEach(function (s) { grid.appendChild(chip(s)); });
       g.appendChild(head); g.appendChild(grid); chips.appendChild(g);
     });
