@@ -959,7 +959,8 @@ HTML = r"""<!doctype html>
   var KMLON = 111.29, KMLAT = 110.57;
 
   // ── Colours ─────────────────────────────────────────────────────────────
-  var RAMP = [[-1, [33, 102, 172]], [-0.5, [146, 197, 222]], [0, [247, 247, 247]], [0.5, [244, 165, 130]], [1, [178, 24, 43]]];
+  var RAMP = [[-1, [26, 79, 156]], [-0.66, [58, 134, 205]], [-0.33, [150, 197, 232]], [0, [242, 242, 240]],
+              [0.33, [246, 176, 138]], [0.66, [226, 92, 62]], [1, [165, 15, 38]]];
   function rampColor(t) {
     t = Math.max(-1, Math.min(1, t));
     for (var i = 1; i < RAMP.length; i++) {
@@ -970,7 +971,8 @@ HTML = r"""<!doctype html>
     }
     return RAMP[RAMP.length - 1][1];
   }
-  var SCALE_MAX = { mean: 20, meanBase: 30, peak: 30, pers: 15 };
+  // Scales sit near the 90th percentile of real values (mean 13, peak 17, persistence 9) so typical features are clearly coloured.
+  var SCALE_MAX = { mean: 12, meanBase: 20, peak: 18, pers: 8 };
 
   // ── State ───────────────────────────────────────────────────────────────
   var S = { h: NH - 1, layer: "mean", win: 3, base: false, arrows: true, stations: true, tap: null, timer: null };
@@ -1007,9 +1009,11 @@ HTML = r"""<!doctype html>
       var v = fieldValue(k), c = confAt(k), row = G.ny - 1 - Math.floor(k / G.nx), col = k % G.nx, o = (row * G.nx + col) * 4;
       if (v == null || c === 0) { img.data[o + 3] = 0; continue; }
       var t = v / mx, rgb = rampColor(pers ? Math.max(0, t) : t);   // persistence: white -> red only
-      var a = 0.2 + 0.8 * Math.min(1, Math.abs(t) * 1.5);
+      var g = Math.sign(t) * Math.pow(Math.min(1, Math.abs(t)), 0.8);    // mild contrast boost for weak values
+      rgb = rampColor(pers ? Math.max(0, g) : g);
+      var a = 0.3 + 0.7 * Math.min(1, Math.abs(t) * 2.2);
       img.data[o] = rgb[0]; img.data[o + 1] = rgb[1]; img.data[o + 2] = rgb[2];
-      img.data[o + 3] = Math.round(255 * a * (c >= 2 ? 1 : 0.55));
+      img.data[o + 3] = Math.round(255 * a * (c >= 2 ? 1 : 0.65));
     }
     octx.putImageData(img, 0, 0);
   }
