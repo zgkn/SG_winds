@@ -20,6 +20,8 @@ from pathlib import Path
 
 import requests
 
+import convergence
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 API_SPEED = "https://api-open.data.gov.sg/v2/real-time/api/wind-speed"
@@ -43,6 +45,7 @@ BACKOFF_BASE     = 2
 
 DATA_FILE = Path("data/wind.json")
 DOCS = Path("docs")
+COAST_FILE = Path("data/sg_coast.json")
 
 # Speed conversion to km/h, keyed by the unit the API reports.
 SPEED_UNIT_TO_KMH = {
@@ -213,6 +216,7 @@ HTML = r"""<!doctype html>
     }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--ink);
          font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
   main { max-width: 900px; margin: 0 auto; padding: 20px 16px 40px; }
@@ -254,6 +258,38 @@ HTML = r"""<!doctype html>
   .chip.off i { background: transparent !important; border: 2px solid var(--faint); }
   .hint { margin-top: 12px; color: var(--muted); font-size: 0.78rem; line-height: 1.5; }
   .empty-state { color: var(--muted); font-size: 0.9rem; padding: 24px 0; text-align: center; }
+
+  .tabs { display: flex; gap: 6px; margin: 0 0 12px; }
+  .tabs button { flex: 1; padding: 10px 8px; font-size: 0.9rem; font-weight: 600; }
+  .tabs button[aria-selected="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  .view.is-off { display: none; }
+  .map-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px 12px; }
+  .map-title { font-size: 0.95rem; font-weight: 600; margin: 0; }
+  .map-sub { font-size: 0.8rem; color: var(--muted); margin: 2px 0 8px; }
+  .map-wrap { position: relative; width: 100%; }
+  #mapCanvas { width: 100%; display: block; border-radius: 6px; touch-action: pan-y; cursor: crosshair; }
+  .legend { margin: 8px 0 2px; }
+  .legend-bar { height: 10px; border-radius: 5px; border: 1px solid var(--border); }
+  .legend-ticks { display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--muted); margin-top: 2px;
+                  font-variant-numeric: tabular-nums; }
+  .legend-cap { font-size: 0.72rem; color: var(--faint); margin-top: 2px; }
+  .slider-row { display: flex; align-items: center; gap: 6px; margin: 10px 0 6px; }
+  .slider-row input[type=range] { flex: 1; min-width: 0; height: 36px; margin: 0; }
+  .slider-row button { padding: 8px 10px; min-width: 40px; font-weight: 600; }
+  .seg { display: flex; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
+  .seg button { flex: 1; padding: 8px 6px; }
+  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  .opts { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 8px 0 2px; font-size: 0.82rem; }
+  .opts label { display: flex; align-items: center; gap: 6px; min-height: 30px; cursor: pointer; }
+  .map-info { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border);
+              font-size: 0.82rem; line-height: 1.5; min-height: 3.2em; }
+  .band { fill: var(--ink); opacity: 0.08; pointer-events: none; }
+  @media (min-width: 1100px) {
+    main { max-width: 1320px; }
+    .tabs { display: none; }
+    .views { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 16px; align-items: start; }
+    .view.is-off { display: block; }
+  }
   @media (max-width: 640px) {
     main { padding: 12px 8px 30px; }
     h1 { font-size: 1.2rem; }
@@ -272,6 +308,13 @@ HTML = r"""<!doctype html>
     </div>
   </header>
 
+  <nav class="tabs" role="tablist" aria-label="View">
+    <button type="button" role="tab" id="tab-ts" aria-selected="true">Time series</button>
+    <button type="button" role="tab" id="tab-map" aria-selected="false">Convergence map</button>
+  </nav>
+
+<div class="views">
+<section class="view" id="view-ts">
   <div class="toolbar">
     <button id="zout" type="button" aria-label="Zoom out">&minus;</button>
     <button id="zin" type="button" aria-label="Zoom in">+</button>
@@ -300,6 +343,48 @@ HTML = r"""<!doctype html>
   </details>
 
   <div class="hint" id="hint"></div>
+</section>
+
+<section class="view is-off" id="view-map">
+  <div class="map-card">
+    <p class="map-title" id="mapTitle"></p>
+    <p class="map-sub" id="mapSub"></p>
+    <div id="mapEmpty" class="empty-state" hidden>No convergence data yet.</div>
+    <div id="mapBody">
+      <div class="map-wrap" id="mapWrap"><canvas id="mapCanvas" aria-label="Wind convergence map of Singapore"></canvas></div>
+      <div class="legend">
+        <div class="legend-bar" id="legBar"></div>
+        <div class="legend-ticks" id="legTicks"></div>
+        <div class="legend-cap" id="legCap"></div>
+      </div>
+      <div class="slider-row">
+        <button type="button" id="hPrev" aria-label="Previous hour">&#9664;</button>
+        <input type="range" id="hSlider" min="0" max="0" step="1" value="0" aria-label="Hour">
+        <button type="button" id="hNext" aria-label="Next hour">&#9654;</button>
+        <button type="button" id="hPlay" aria-label="Play">Play</button>
+        <button type="button" id="hLatest">Latest</button>
+      </div>
+      <div class="seg" id="layerSeg">
+        <button type="button" data-layer="mean" aria-pressed="true">Hourly mean</button>
+        <button type="button" data-layer="peak" aria-pressed="false">Hourly peak</button>
+        <button type="button" data-layer="pers" aria-pressed="false">Persistence</button>
+      </div>
+      <div class="seg" id="winSeg" hidden>
+        <button type="button" data-win="3" aria-pressed="true">Last 3 h</button>
+        <button type="button" data-win="6" aria-pressed="false">Last 6 h</button>
+        <button type="button" data-win="24" aria-pressed="false">Last 24 h</button>
+      </div>
+      <div class="opts">
+        <label><input type="checkbox" id="optArrows" checked> Wind arrows</label>
+        <label><input type="checkbox" id="optStn" checked> Stations</label>
+        <label id="optBaseWrap"><input type="checkbox" id="optBase"> Add back the fixed 24 h pattern</label>
+      </div>
+      <div class="map-info" id="mapInfo">Tap the map for values at a point.</div>
+    </div>
+  </div>
+  <div class="hint" id="mapHint"></div>
+</section>
+</div>
 </main>
 
 <div class="tooltip" id="tooltip" hidden></div>
@@ -379,6 +464,13 @@ HTML = r"""<!doctype html>
   var allSeries = stations.concat(averages);
 
   document.addEventListener("DOMContentLoaded", init);
+  window.addEventListener("hourselect", function (e) {
+    state.hourBand = e.detail ? [e.detail.start, e.detail.end] : null;
+    if (state.panels.length) renderAll();
+  });
+  window.addEventListener("tabshown", function (e) {
+    if (e.detail === "ts" && state.panels.length) { measureWidth(); renderAll(); }
+  });
 
   function init() {
     els.subtitle = document.getElementById("subtitle");
@@ -571,6 +663,11 @@ HTML = r"""<!doctype html>
       }
     });
 
+    if (state.hourBand) {
+      var bx0 = x(state.hourBand[0]), bx1 = x(state.hourBand[1]);
+      panel.plot.appendChild(svgEl("rect", { class: "band", x: Math.min(bx0, bx1), y: 0,
+        width: Math.abs(bx1 - bx0), height: innerH }));
+    }
     var r = visibleRange();
     // Stations first, region averages on top.
     allSeries.forEach(function (s) {
@@ -679,7 +776,11 @@ HTML = r"""<!doctype html>
           else svg.classList.remove("dragging");
         }
       } else if (dragState && a.length === 0) { dragState = null; svg.classList.remove("dragging"); }
-      if (wasTap) { panel.tapStart = null; state.pinned = true; showReadings(panel, evt); }
+      if (wasTap) {
+        panel.tapStart = null; state.pinned = true; showReadings(panel, evt);
+        var fr = Math.max(0, Math.min(1, localXFromClientX(svg, evt.clientX) / panel.innerW));
+        window.dispatchEvent(new CustomEvent("charttime", { detail: { ms: state.viewDomain[0] + fr * (state.viewDomain[1] - state.viewDomain[0]) } }));
+      }
     }
     svg.addEventListener("pointerup", endPointer);
     svg.addEventListener("pointercancel", endPointer);
@@ -810,6 +911,280 @@ HTML = r"""<!doctype html>
   function refreshChips() { allSeries.forEach(function (s) { if (s.chip) s.chip.classList.toggle("off", !s.on); }); }
 })();
 </script>
+<script>
+(function () {
+  "use strict";
+  var CONV = __CONV__;
+  var $ = function (id) { return document.getElementById(id); };
+  var COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+
+  // ── Tabs ────────────────────────────────────────────────────────────────
+  var views = { ts: $("view-ts"), map: $("view-map") }, tabs = { ts: $("tab-ts"), map: $("tab-map") };
+  function showTab(name, fromHash) {
+    Object.keys(views).forEach(function (k) {
+      views[k].classList.toggle("is-off", k !== name);
+      tabs[k].setAttribute("aria-selected", k === name ? "true" : "false");
+    });
+    if (!fromHash) { try { history.replaceState(null, "", name === "map" ? "#map" : location.pathname + location.search); } catch (e) {} }
+    window.dispatchEvent(new CustomEvent("tabshown", { detail: name }));
+  }
+  tabs.ts.onclick = function () { showTab("ts"); };
+  tabs.map.onclick = function () { showTab("map"); };
+  if (location.hash === "#map") showTab("map", true);
+
+  if (!CONV || !CONV.hours || !CONV.hours.length) {
+    $("mapBody").hidden = true; $("mapEmpty").hidden = false;
+    $("mapTitle").textContent = "Wind convergence";
+    return;
+  }
+
+  // ── Data ────────────────────────────────────────────────────────────────
+  function decode(s) {
+    var bin = atob(s), a = new Int8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) a[i] = (bin.charCodeAt(i) << 24) >> 24;
+    return a;
+  }
+  var G = CONV.grid, NC = G.nx * G.ny, NH = CONV.hours.length, NODATA = CONV.nodata, SC = CONV.scale;
+  var L = { mean: decode(CONV.mean), peak: decode(CONV.peak), pos: decode(CONV.pos), sig: decode(CONV.sig),
+            base: decode(CONV.base), conf: decode(CONV.conf) };
+  var hourMs = CONV.hours.map(function (h) { return Date.parse(h.t + ":00Z"); });   // SGT wall-clock as UTC
+  var HOUR = 3600000;
+  function fmt(ms, o) { return new Intl.DateTimeFormat("en-GB", Object.assign({ timeZone: "UTC" }, o)).format(new Date(ms)); }
+  var fmtHM = function (ms) { return fmt(ms, { hour: "2-digit", minute: "2-digit", hour12: false }); };
+  var fmtDay = function (ms) { return fmt(ms, { weekday: "short", day: "numeric", month: "short" }); };
+
+  // Map extent (degrees) and projection with a km-true aspect ratio.
+  var EXT = { lon0: 103.59, lon1: 104.10, lat0: 1.17, lat1: 1.48 };
+  var ASPECT = ((EXT.lon1 - EXT.lon0) * 111.29) / ((EXT.lat1 - EXT.lat0) * 110.57);
+  var KMLON = 111.29, KMLAT = 110.57;
+
+  // ── Colours ─────────────────────────────────────────────────────────────
+  var RAMP = [[-1, [33, 102, 172]], [-0.5, [146, 197, 222]], [0, [247, 247, 247]], [0.5, [244, 165, 130]], [1, [178, 24, 43]]];
+  function rampColor(t) {
+    t = Math.max(-1, Math.min(1, t));
+    for (var i = 1; i < RAMP.length; i++) {
+      if (t <= RAMP[i][0]) {
+        var a = RAMP[i - 1], b = RAMP[i], f = (t - a[0]) / (b[0] - a[0]);
+        return [0, 1, 2].map(function (k) { return Math.round(a[1][k] + f * (b[1][k] - a[1][k])); });
+      }
+    }
+    return RAMP[RAMP.length - 1][1];
+  }
+  var SCALE_MAX = { mean: 20, meanBase: 30, peak: 30, pers: 15 };
+
+  // ── State ───────────────────────────────────────────────────────────────
+  var S = { h: NH - 1, layer: "mean", win: 3, base: false, arrows: true, stations: true, tap: null, timer: null };
+  var canvas = $("mapCanvas"), ctx = canvas.getContext("2d"), off = document.createElement("canvas");
+  off.width = G.nx; off.height = G.ny;
+  var cssv = function (n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); };
+  var W = 0, H = 0;
+  function X(lon) { return (lon - EXT.lon0) / (EXT.lon1 - EXT.lon0) * W; }
+  function Y(lat) { return (EXT.lat1 - lat) / (EXT.lat1 - EXT.lat0) * H; }
+  function lonAt(px) { return EXT.lon0 + px / W * (EXT.lon1 - EXT.lon0); }
+  function latAt(py) { return EXT.lat1 - py / H * (EXT.lat1 - EXT.lat0); }
+
+  function at(arr, h, k) { var v = arr[h * NC + k]; return v === NODATA ? null : v / SC; }
+  function scaleMax() { return S.layer === "mean" ? (S.base ? SCALE_MAX.meanBase : SCALE_MAX.mean) : SCALE_MAX[S.layer]; }
+
+  function fieldValue(k) {
+    var h = S.h, v, i;
+    if (S.layer === "pers") {
+      var lo = Math.max(0, h - S.win + 1), sum = 0, n = 0;
+      for (i = lo; i <= h; i++) { v = at(L.pos, i, k); if (v != null) { sum += v; n++; } }
+      return n ? sum / n : null;
+    }
+    v = at(S.layer === "peak" ? L.peak : L.mean, h, k);
+    if (v != null && S.layer === "mean" && S.base) { var b = L.base[k]; if (b !== NODATA) v += b / SC; }
+    return v;
+  }
+  function sigmaValue(k) { var v = L.sig[S.h * NC + k]; return v === NODATA ? null : v / 4; }
+  function confAt(k) { return L.conf[k] / 1; }   // 0 none, 1 faded, 2 solid
+
+  // ── Drawing ─────────────────────────────────────────────────────────────
+  function paintField() {
+    var octx = off.getContext("2d"), img = octx.createImageData(G.nx, G.ny), mx = scaleMax(), pers = S.layer === "pers";
+    for (var k = 0; k < NC; k++) {
+      var v = fieldValue(k), c = confAt(k), row = G.ny - 1 - Math.floor(k / G.nx), col = k % G.nx, o = (row * G.nx + col) * 4;
+      if (v == null || c === 0) { img.data[o + 3] = 0; continue; }
+      var t = v / mx, rgb = rampColor(pers ? Math.max(0, t) : t);   // persistence: white -> red only
+      var a = 0.2 + 0.8 * Math.min(1, Math.abs(t) * 1.5);
+      img.data[o] = rgb[0]; img.data[o + 1] = rgb[1]; img.data[o + 2] = rgb[2];
+      img.data[o + 3] = Math.round(255 * a * (c >= 2 ? 1 : 0.55));
+    }
+    octx.putImageData(img, 0, 0);
+  }
+
+  function arrow(x, y, dx, dy, color) {
+    var len = Math.hypot(dx, dy); if (len < 1) return;
+    var ux = dx / len, uy = dy / len, hx = x + dx, hy = y + dy, hs = Math.min(6, 3 + len / 6);
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(hx, hy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(hx, hy);
+    ctx.lineTo(hx - ux * hs - uy * hs * 0.6, hy - uy * hs + ux * hs * 0.6);
+    ctx.lineTo(hx - ux * hs + uy * hs * 0.6, hy - uy * hs - ux * hs * 0.6);
+    ctx.closePath(); ctx.fillStyle = color; ctx.fill();
+  }
+
+  function draw() {
+    W = $("mapWrap").clientWidth; if (W < 50) return;
+    H = Math.round(W / ASPECT);
+    var dpr = window.devicePixelRatio || 1;
+    canvas.style.height = H + "px"; canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = cssv("--bg") || "#f9f9f7"; ctx.fillRect(0, 0, W, H);
+
+    // land
+    function ring(r) { r.forEach(function (p, i) { if (i) ctx.lineTo(X(p[0]), Y(p[1])); else ctx.moveTo(X(p[0]), Y(p[1])); }); ctx.closePath(); }
+    ctx.beginPath(); (CONV.coast || []).forEach(ring);
+    ctx.fillStyle = cssv("--grid") || "#e1e0d9"; ctx.fill();
+
+    // convergence field (smoothly upscaled)
+    paintField();
+    var lonL = G.lon0 - G.dlon / 2, lonR = lonL + G.nx * G.dlon, latB = G.lat0 - G.dlat / 2, latT = latB + G.ny * G.dlat;
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(off, X(lonL), Y(latT), X(lonR) - X(lonL), Y(latB) - Y(latT));
+
+    // coast
+    ctx.beginPath(); (CONV.coast || []).forEach(ring);
+    ctx.strokeStyle = cssv("--faint") || "#898781"; ctx.lineWidth = 1; ctx.stroke();
+
+    var ink = cssv("--ink") || "#0b0b0b", pxPerKmh = (W / 360) * 1.5;
+    if (S.arrows) {
+      ctx.strokeStyle = ink; ctx.lineWidth = 1.6; ctx.lineCap = "round";
+      CONV.stations.forEach(function (st) {
+        var w = CONV.wind[st.id] && CONV.wind[st.id][S.h]; if (!w) return;
+        var len = Math.min(Math.hypot(w[0], w[1]) * pxPerKmh, W * 0.1), sp = Math.hypot(w[0], w[1]) || 1;
+        arrow(X(st.lon), Y(st.lat), w[0] / sp * len, -w[1] / sp * len, ink);
+      });
+    }
+    if (S.stations || S.arrows) {
+      CONV.stations.forEach(function (st) {
+        ctx.beginPath(); ctx.arc(X(st.lon), Y(st.lat), 2.6, 0, 6.2832);
+        ctx.fillStyle = cssv("--bg") || "#fff"; ctx.fill(); ctx.lineWidth = 1.4; ctx.strokeStyle = ink; ctx.stroke();
+      });
+    }
+    if (S.tap) {
+      ctx.beginPath(); ctx.arc(X(S.tap.lon), Y(S.tap.lat), 7, 0, 6.2832);
+      ctx.lineWidth = 2; ctx.strokeStyle = ink; ctx.stroke();
+    }
+  }
+
+  // ── Legend / labels ─────────────────────────────────────────────────────
+  var LAYER_NAME = { mean: "Hourly mean convergence", peak: "Hourly peak convergence", pers: "Persistent convergence" };
+  function labels() {
+    var h = CONV.hours[S.h], t = hourMs[S.h], mx = scaleMax(), pers = S.layer === "pers";
+    var span = fmtHM(t) + "–" + fmtHM(t + HOUR);
+    $("mapTitle").textContent = LAYER_NAME[S.layer] + (S.layer === "pers" ? ", last " + Math.min(S.win, S.h + 1) + " h" : "");
+    $("mapSub").textContent = fmtDay(t) + " " + span + " SGT · " + h.n + "/12 steps" + (h.n < 12 ? " (partial hour)" : "") +
+      " · " + h.stn + " stations";
+    var stops = pers ? [0, 0.5, 1] : [-1, -0.5, 0, 0.5, 1];
+    $("legBar").style.background = "linear-gradient(to right," + stops.map(function (v) {
+      var c = rampColor(v); return "rgb(" + c.join(",") + ")"; }).join(",") + ")";
+    var lab = pers ? [0, mx / 2, mx] : [-mx, 0, mx];
+    $("legTicks").innerHTML = lab.map(function (v, i) { return "<span>" + (v > 0 && !pers ? "+" : "") + Math.round(v * 10) / 10 + (i === lab.length - 1 && !pers ? "+" : "") + "</span>"; }).join("");
+    $("legCap").textContent = pers
+      ? "Average convergent part of the wind anomaly, ×10⁻⁵ s⁻¹ (red = persistent convergence)"
+      : "Wind-anomaly convergence, ×10⁻⁵ s⁻¹ (red = converging, blue = diverging)";
+    $("hSlider").value = S.h; $("hSlider").max = NH - 1;
+    $("hPrev").disabled = S.h === 0; $("hNext").disabled = S.h === NH - 1;
+    $("winSeg").hidden = !pers; $("optBaseWrap").hidden = S.layer !== "mean";
+    $("hPlay").textContent = S.timer ? "Pause" : "Play";
+  }
+
+  function nearest(lon, lat) {
+    var best = null, bd = 1e9;
+    CONV.stations.forEach(function (st) {
+      var d = Math.hypot((st.lon - lon) * KMLON, (st.lat - lat) * KMLAT);
+      if (d < bd) { bd = d; best = st; }
+    });
+    return { st: best, km: bd };
+  }
+  function info() {
+    var el = $("mapInfo");
+    if (!S.tap) { el.textContent = "Tap the map for values at a point."; return; }
+    var gx = Math.round((S.tap.lon - G.lon0) / G.dlon), gy = Math.round((S.tap.lat - G.lat0) / G.dlat), txt;
+    var near = nearest(S.tap.lon, S.tap.lat), w = CONV.wind[near.st.id] && CONV.wind[near.st.id][S.h];
+    if (gx < 0 || gy < 0 || gx >= G.nx || gy >= G.ny) { txt = "Outside the analysed area."; }
+    else {
+      var k = gy * G.nx + gx, v = fieldValue(k), c = confAt(k);
+      if (v == null || c === 0) txt = "Too far from any station (over " + CONV.params.mask_km + " km) to estimate convergence here.";
+      else {
+        var sg = S.layer === "mean" ? sigmaValue(k) : null;
+        txt = "<strong>" + (v >= 0 ? "+" : "") + v.toFixed(1) + "</strong> ×10⁻⁵ s⁻¹ " + (v >= 0 ? "convergence" : "divergence") +
+          (sg != null ? " (±" + sg.toFixed(1) + (Math.abs(v) < 2 * sg ? ", within noise" : "") + ")" : "") +
+          (c < 2 ? " · low confidence, far from stations" : "");
+      }
+    }
+    if (w) {
+      var sp = Math.hypot(w[0], w[1]), dir = (Math.atan2(-w[0], -w[1]) * 180 / Math.PI + 360) % 360;
+      txt += "<br>Nearest station: " + near.st.name + " (" + near.km.toFixed(1) + " km), hourly wind " + sp.toFixed(1) + " km/h from " +
+        COMPASS[Math.round(dir / 22.5) % 16] + " " + Math.round(dir) + "°";
+    }
+    el.innerHTML = txt;
+  }
+
+  // ── Interaction ─────────────────────────────────────────────────────────
+  function render() { labels(); draw(); info(); }
+  function select(h, quiet) {
+    S.h = Math.max(0, Math.min(NH - 1, h)); render();
+    if (!quiet) window.dispatchEvent(new CustomEvent("hourselect", { detail: { start: hourMs[S.h], end: hourMs[S.h] + HOUR } }));
+  }
+  function stop() { if (S.timer) { clearInterval(S.timer); S.timer = null; } }
+  $("hSlider").oninput = function () { stop(); select(+this.value); };
+  $("hPrev").onclick = function () { stop(); select(S.h - 1); };
+  $("hNext").onclick = function () { stop(); select(S.h + 1); };
+  $("hLatest").onclick = function () { stop(); select(NH - 1); };
+  $("hPlay").onclick = function () {
+    if (S.timer) { stop(); labels(); return; }
+    if (S.h >= NH - 1) select(0);
+    S.timer = setInterval(function () { if (S.h >= NH - 1) { stop(); labels(); return; } select(S.h + 1); }, 900);
+    labels();
+  };
+  Array.prototype.forEach.call(document.querySelectorAll("#layerSeg button"), function (b) {
+    b.onclick = function () {
+      S.layer = b.dataset.layer;
+      Array.prototype.forEach.call(document.querySelectorAll("#layerSeg button"), function (x) { x.setAttribute("aria-pressed", x === b ? "true" : "false"); });
+      render();
+    };
+  });
+  Array.prototype.forEach.call(document.querySelectorAll("#winSeg button"), function (b) {
+    b.onclick = function () {
+      S.win = +b.dataset.win;
+      Array.prototype.forEach.call(document.querySelectorAll("#winSeg button"), function (x) { x.setAttribute("aria-pressed", x === b ? "true" : "false"); });
+      render();
+    };
+  });
+  $("optArrows").onchange = function () { S.arrows = this.checked; render(); };
+  $("optStn").onchange = function () { S.stations = this.checked; render(); };
+  $("optBase").onchange = function () { S.base = this.checked; render(); };
+
+  function tapAt(evt) {
+    var r = canvas.getBoundingClientRect();
+    S.tap = { lon: lonAt((evt.clientX - r.left) / r.width * W), lat: latAt((evt.clientY - r.top) / r.height * H) };
+    draw(); info();
+  }
+  canvas.addEventListener("pointerup", tapAt);
+  canvas.addEventListener("pointermove", function (e) { if (e.pointerType === "mouse") tapAt(e); });
+
+  // Time-series tap selects the matching hour.
+  window.addEventListener("charttime", function (e) {
+    for (var i = 0; i < NH; i++) {
+      if (e.detail.ms >= hourMs[i] && e.detail.ms < hourMs[i] + HOUR) { if (i !== S.h) { stop(); select(i); } return; }
+    }
+  });
+  window.addEventListener("tabshown", function (e) { if (e.detail === "map") render(); });
+  window.addEventListener("resize", function () { clearTimeout(S.rt); S.rt = setTimeout(draw, 120); });
+  if (window.ResizeObserver) new ResizeObserver(function () { clearTimeout(S.rt); S.rt = setTimeout(draw, 60); }).observe($("mapWrap"));
+
+  $("mapHint").innerHTML = "Convergence is how much the surface wind is piling up: red areas are where air converges (the usual trigger for sea-breeze fronts and showers, and where pollutants collect), blue where it spreads out. " +
+    "It is computed from each station's <em>change from its own 24 h average</em>, because station exposure differs and would otherwise create permanent false patterns; tick the box to add that fixed pattern back. " +
+    "With about 18 stations, only features larger than roughly 10 km are resolved, and cells far from any station are blank or faded.";
+  document.addEventListener("DOMContentLoaded", function () {
+    $("hSlider").max = NH - 1; render();
+    window.dispatchEvent(new CustomEvent("hourselect", { detail: { start: hourMs[S.h], end: hourMs[S.h] + HOUR } }));
+  });
+  if (document.readyState !== "loading") { $("hSlider").max = NH - 1; render(); }
+})();
+</script>
 </body>
 </html>
 """
@@ -842,7 +1217,18 @@ def render(store):
                                    for sid, info in store["stations"].items()},
              "regions": REGIONS}
     payload = json.dumps(store, separators=(",", ":")).replace("</", "<\\/")
-    html = HTML.replace("__DATA__", payload)
+    conv_json = "null"
+    try:
+        coast = json.loads(COAST_FILE.read_text()) if COAST_FILE.exists() else None
+        conv = convergence.compute(store, coast)
+        if conv:
+            conv_json = json.dumps(conv, separators=(",", ":")).replace("</", "<\\/")
+            print(f"  Convergence: {len(conv['hours'])} hourly fields, {len(conv_json)//1024} KB")
+        else:
+            print("  Convergence: not enough data, map left empty")
+    except Exception as e:                       # never let the map break the main page
+        print(f"  ⚠ convergence skipped: {e!r}")
+    html = HTML.replace("__DATA__", payload).replace("__CONV__", conv_json)
     (DOCS / "index.html").write_text(html, encoding="utf-8")
 
 
