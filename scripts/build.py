@@ -1041,11 +1041,17 @@ HTML = r"""<!doctype html>
     ctx.beginPath(); (CONV.coast || []).forEach(ring);
     ctx.fillStyle = cssv("--grid") || "#e1e0d9"; ctx.fill();
 
-    // convergence field (smoothly upscaled)
+    // convergence field: hard-edged grid cells (no upscaling smoothing), with a thin outline per cell
     paintField();
     var lonL = G.lon0 - G.dlon / 2, lonR = lonL + G.nx * G.dlon, latB = G.lat0 - G.dlat / 2, latT = latB + G.ny * G.dlat;
-    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+    ctx.imageSmoothingEnabled = false;
     ctx.drawImage(off, X(lonL), Y(latT), X(lonR) - X(lonL), Y(latB) - Y(latT));
+    ctx.strokeStyle = "rgba(60,60,60,0.28)"; ctx.lineWidth = 0.5;
+    for (var gk = 0; gk < NC; gk++) {
+      if (fieldValue(gk) == null || confAt(gk) === 0) continue;
+      var gx = X(lonL + (gk % G.nx) * G.dlon), gy = Y(latB + (Math.floor(gk / G.nx) + 1) * G.dlat);
+      ctx.strokeRect(gx, gy, X(lonL + G.dlon) - X(lonL), Y(latB) - Y(latB + G.dlat));
+    }
 
     // coast
     ctx.beginPath(); (CONV.coast || []).forEach(ring);
