@@ -608,13 +608,11 @@ def render_convergence_overlay(convergence):
     norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
     cmap = matplotlib.colormaps["RdBu_r"]
 
-    # pcolormesh renders each grid cell as a flat, distinct tile (unlike
-    # imshow's smooth interpolation), and edgecolors draws a visible border
-    # around every cell so the grid structure itself is clearly visible.
-    ax.pcolormesh(glon, glat, convergence, cmap=cmap, norm=norm,
-                  shading="nearest", alpha=0.65,
-                  edgecolors="#33415560", linewidth=0.6,
-                  antialiased=False)
+    # imshow with nearest-neighbor interpolation renders grid cells as
+    # sharp tiles with no smoothing or blur between cells.
+    ax.imshow(convergence, cmap=cmap, norm=norm, alpha=0.65,
+              extent=[CONV_LON_MIN, CONV_LON_MAX, CONV_LAT_MIN, CONV_LAT_MAX],
+              origin="upper", interpolation="nearest")
     ax.set_xlim(CONV_LON_MIN, CONV_LON_MAX)
     ax.set_ylim(CONV_LAT_MIN, CONV_LAT_MAX)
     ax.set_aspect("auto")
