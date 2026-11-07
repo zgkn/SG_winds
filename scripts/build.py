@@ -563,15 +563,16 @@ def build_convergence_field(speed_ts, dir_ts, station_info, grid_n=CONV_GRID_N):
     grid_lon = np.linspace(CONV_LON_MIN, CONV_LON_MAX, grid_n)
     glon, glat = np.meshgrid(grid_lon, grid_lat)  # both (grid_n, grid_n)
 
-    # Nearest-neighbor interpolation: each grid point takes the u/v from
-    # the closest station, preserving sharp edges without smoothing.
-    flat_glat = glat.ravel()
-    flat_glon = glon.ravel()
-    d2 = ((lats[:, None] - flat_glat[None, :]) ** 2 +
-          (lons[:, None] - flat_glon[None, :]) ** 2)
-    nearest_idx = np.argmin(d2, axis=0)
-    u_grid = us[nearest_idx].reshape(glat.shape)
-    v_grid = vs[nearest_idx].reshape(glat.shape)
+    # Inverse-distance-weighted interpolation (power=2). Degrees are fine
+    # as a distance metric at Singapore's scale/latitude (~0.3° across).
+    d2 = ((lats[:, None] - glat.ravel()[None, :]) ** 2 +
+          (lons[:, None] - glon.ravel()[None, :]) ** 2)
+    d2 = np.maximum(d2, 1e-12)
+    w = 1.0 / d2
+    u_grid = (w * us[:, None]).sum(axis=0) / w.sum(axis=0)
+    v_grid = (w * vs[:, None]).sum(axis=0) / w.sum(axis=0)
+    u_grid = u_grid.reshape(glat.shape)
+    v_grid = v_grid.reshape(glat.shape)
 
     # Degree spacing -> metres, so the gradient is a physically-scaled s^-1 rate.
     mean_lat_rad = math.radians(np.mean(lats))
