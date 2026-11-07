@@ -1,64 +1,81 @@
 """
-build.py — Maintain a rolling 24h store of NEA wind data and render an
-interactive SVG chart (same pan/zoom engine as the AQ dashboard).
+build.py — Fetch NEA wind data for all stations and render a static website.
 
-Each run:
-  1. loads data/wind.json (the persistent store, committed to the repo)
-  2. drops readings older than 24h
-  3. works out which time slots in the last 24h are missing and downloads
-     only those (so the first run backfills 24h, later runs fill the gap)
-  4. saves data/wind.json and writes docs/index.html (data embedded inline)
+Outputs to ./docs/  (served by GitHub Pages).
 
-Environment variables:
-  NEA_API_KEY   optional — doubles rate limit from 6 → 12 calls/10 s
-  STEP_MINUTES  sampling interval in minutes (default 5)
+Environment variables (set by Actions):
+  START_DATETIME   YYYY-MM-DDTHH:MM (SGT), inclusive
+  END_DATETIME     YYYY-MM-DDTHH:MM (SGT), inclusive
+  NEA_API_KEY      optional — doubles rate limit from 6 → 12 calls/10 s
 """
 
-import os, time, json
-from datetime import datetime, timedelta, timezone
+import os, sys, re, time, json, math, base64, io
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
-
-import convergence
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.gridspec as gridspec
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize, TwoSlopeNorm
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 API_SPEED = "https://api-open.data.gov.sg/v2/real-time/api/wind-speed"
 API_DIR   = "https://api-open.data.gov.sg/v2/real-time/api/wind-direction"
 
-API_KEY      = os.environ.get("NEA_API_KEY", "")
-STEP_MINUTES = int(os.environ.get("STEP_MINUTES", "5"))
-WINDOW       = timedelta(hours=24)
-# Slots newer than this may simply not be published yet, so an empty answer
-# is not recorded (it will be retried next run). Older empty slots are
-# stored as empty so a permanent API outage isn't re-fetched forever.
-SETTLE       = timedelta(minutes=30)
+DATETIME_FMT = "%Y-%m-%dT%H:%M"
 
-SGT = timezone(timedelta(hours=8))
-TS_FMT = "%Y-%m-%dT%H:%M"
+API_KEY  = os.environ.get("NEA_API_KEY", "")
+START_DT = datetime.strptime(os.environ.get("START_DATETIME", "2026-09-12T08:00"), DATETIME_FMT)
+END_DT   = datetime.strptime(os.environ.get("END_DATETIME",   "2026-09-12T09:00"), DATETIME_FMT)
 
+if END_DT < START_DT:
+    sys.exit(f"END_DATETIME ({END_DT}) is before START_DATETIME ({START_DT})")
+
+# Display strings for chart titles / page header / footer.
+if START_DT.date() == END_DT.date():
+    PERIOD_LABEL = f"{START_DT:%Y-%m-%d}  {START_DT:%H:%M}–{END_DT:%H:%M} SGT"
+else:
+    PERIOD_LABEL = f"{START_DT:%Y-%m-%d %H:%M} – {END_DT:%Y-%m-%d %H:%M} SGT"
+
+# Rate-limit: 6 calls/10 s without key, 12 with key (reset every 10 s)
 CALLS_PER_WINDOW = 12 if API_KEY else 6
-WINDOW_SECS      = 11
+WINDOW_SECS      = 11        # slightly over 10 s for safety
 MAX_RETRIES      = 6
 BACKOFF_BASE     = 2
 
-DATA_FILE = Path("data/wind.json")
 DOCS = Path("docs")
-COAST_FILE = Path("data/sg_coast.json")
+DOCS.mkdir(exist_ok=True)
 
-# Speed conversion to km/h, keyed by the unit the API reports.
-SPEED_UNIT_TO_KMH = {
-    "knot": 1.852, "knots": 1.852, "kt": 1.852, "kts": 1.852,
-    "m/s": 3.6, "mps": 3.6, "meter per second": 3.6, "meters per second": 3.6,
-    "metre per second": 3.6, "metres per second": 3.6,
-    "km/h": 1.0, "kmh": 1.0, "kph": 1.0,
-    "kilometer per hour": 1.0, "kilometre per hour": 1.0,
+# ── Known NEA station metadata (id, name, lat, lon) ─────────────────────────
+# Sourced from data.gov.sg historical wind datasets and NEA station lists.
+# The API returns metadata dynamically; this is used for the map only.
+STATION_META = {
+    "S50":  ("Clementi Road",           1.3337,  103.7768),
+    "S43":  ("Kim Chuan Road",          1.3399,  103.8878),
+    "S109": ("Ang Mo Kio Avenue 5",     1.3764,  103.8492),
+    "S111": ("Scotts Road",             1.3105,  103.8365),
+    "S107": ("Nanyang Avenue",          1.3415,  103.6812),
+    "S117": ("Banyan Road",             1.2560,  103.6790),
+    "S104": ("Woodlands Avenue 9",      1.4387,  103.7870),
+    "S106": ("Pulau Ubin",              1.4042,  103.9675),
+    "S108": ("Marina Gardens Drive",    1.2799,  103.8703),
+    "S116": ("West Coast Highway",      1.2994,  103.7548),
+    "S115": ("Tuas South Avenue 3",     1.2894,  103.6318),
+    "S60":  ("Sentosa Island",          1.2494,  103.8303),
+    "S44":  ("Buona Vista",             1.3069,  103.7900),
+    "S121": ("Jurong Island",           1.2677,  103.7018),
+    "S122": ("Ulu Pandan Road",         1.3211,  103.7716),
+    "S24":  ("Upper Changi Road North", 1.3678,  103.9829),
+    "S40":  ("Tai Seng",                1.3357,  103.8878),  # approximate
 }
-DEFAULT_UNIT = "knots"  # NEA's confirmed unit as of 2026-09-12
 
-
-# ── Fetching ──────────────────────────────────────────────────────────────────
+# ── Fetch helpers ─────────────────────────────────────────────────────────────
 
 def headers():
     h = {"Accept": "application/json"}
@@ -87,20 +104,29 @@ def fetch(endpoint, dt):
 
 
 def extract(payload):
-    """Return ({stationId: value}, {stationId: {name, lat, lon}}, unit)."""
-    readings, meta, unit = {}, {}, None
+    """
+    Return ({stationId: value}, station_metadata, reading_unit) from one
+    API response. reading_unit is whatever the API itself reports (e.g.
+    "knots" or "m/s") via data.readingUnit, or None if absent — used to
+    verify the assumption baked into speed_to_kmh() rather than trusting it
+    blindly.
+    """
+    readings = {}
+    meta = {}
+    reading_unit = None
     if not payload:
-        return readings, meta, unit
+        return readings, meta, reading_unit
     try:
         data = payload.get("data", {})
-        unit = data.get("readingUnit")
+        reading_unit = data.get("readingUnit")
+        # Station metadata (lat/lon) comes from the first response
         for s in data.get("stations", []):
             sid = s.get("id") or s.get("stationId")
             if sid:
                 loc = s.get("location", s.get("labelLocation", {}))
                 meta[sid] = {
                     "name": s.get("name", sid),
-                    "lat":  float(loc.get("latitude", 0)),
+                    "lat":  float(loc.get("latitude",  0)),
                     "lon":  float(loc.get("longitude", 0)),
                 }
         for block in data.get("readings", []):
@@ -109,1145 +135,781 @@ def extract(payload):
                 val = item.get("value")
                 if sid and val is not None:
                     readings[sid] = float(val)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError):
         pass
-    return readings, meta, unit
+    return readings, meta, reading_unit
 
 
-def speed_factor(unit):
-    key = (unit or "").strip().lower()
-    if key in SPEED_UNIT_TO_KMH:
-        return SPEED_UNIT_TO_KMH[key]
-    if unit:
-        print(f"  ⚠ unrecognised speed unit '{unit}', assuming {DEFAULT_UNIT}")
-    return SPEED_UNIT_TO_KMH[DEFAULT_UNIT]
+# ── Data collection ───────────────────────────────────────────────────────────
 
+def collect():
+    """
+    Build minute-by-minute time series for all stations.
+    Returns:
+        timestamps  : list[datetime]
+        speed_ts    : dict[stationId -> list[float|nan]]
+        dir_ts      : dict[stationId -> list[float|nan]]
+        station_info: dict[stationId -> {name, lat, lon}]
+        units       : dict with "speed"/"direction" -> unit string reported
+                      by the API (or None if it never included one). Also
+                      updates the module-level SPEED_UNIT_FACTOR to match
+                      what the API actually reports, rather than trusting a
+                      hardcoded assumption.
+    """
+    minutes = []
+    t = START_DT
+    while t <= END_DT:
+        minutes.append(t)
+        t += timedelta(minutes=1)
 
-# ── Store ─────────────────────────────────────────────────────────────────────
+    total  = len(minutes)
+    print(f"\nFetching {total} minutes × 2 endpoints = {total*2} calls")
+    print(f"Rate limit: {CALLS_PER_WINDOW} calls/10s  →  batch every {WINDOW_SECS}s\n")
 
-def load_store():
-    if DATA_FILE.exists():
-        try:
-            return json.loads(DATA_FILE.read_text())
-        except json.JSONDecodeError:
-            print("  ⚠ data/wind.json is corrupt, starting fresh")
-    return {"stations": {}, "readings": {}}
+    speed_ts    = {}
+    dir_ts      = {}
+    station_info = {}
+    timestamps  = []
+    units       = {"speed": None, "direction": None}
 
-
-def save_store(store):
-    DATA_FILE.parent.mkdir(exist_ok=True)
-    DATA_FILE.write_text(json.dumps(store, separators=(",", ":"), sort_keys=True))
-
-
-def expected_slots(now):
-    """All slot times in the last 24h, aligned to STEP_MINUTES, oldest first."""
-    step = timedelta(minutes=STEP_MINUTES)
-    end = now.replace(second=0, microsecond=0)
-    end -= timedelta(minutes=end.minute % STEP_MINUTES)
-    start = end - WINDOW
-    slots, t = [], start
-    while t <= end:
-        slots.append(t)
-        t += step
-    return slots
-
-
-def update(store, now):
-    slots = expected_slots(now)
-    keep = {t.strftime(TS_FMT) for t in slots}
-    store["readings"] = {k: v for k, v in store["readings"].items() if k >= min(keep)}
-
-    missing = [t for t in slots if t.strftime(TS_FMT) not in store["readings"]]
-    print(f"  Window: {slots[0]:{TS_FMT}} → {slots[-1]:{TS_FMT}} SGT "
-          f"({len(slots)} slots, {len(missing)} missing)")
-    if not missing:
-        return
-
-    print(f"  Fetching {len(missing)} slots × 2 endpoints "
-          f"({CALLS_PER_WINDOW} calls/10s)\n")
+    # We can fit CALLS_PER_WINDOW / 2 minute-steps per window
+    # (2 calls per step: speed + direction)
     batch_size = max(1, CALLS_PER_WINDOW // 2)
-    unit = store.get("speed_unit")
 
-    for b in range(0, len(missing), batch_size):
-        for t in missing[b:b + batch_size]:
-            sp, sp_meta, sp_unit = extract(fetch(API_SPEED, t))
-            dr, dr_meta, _       = extract(fetch(API_DIR, t))
-            for sid, info in {**sp_meta, **dr_meta}.items():
-                store["stations"].setdefault(sid, info)
-            if sp_unit:
-                unit = sp_unit
-            factor = speed_factor(sp_unit or unit)
+    for batch_start in range(0, total, batch_size):
+        batch = minutes[batch_start: batch_start + batch_size]
 
-            key = t.strftime(TS_FMT)
-            if sp or dr:
-                store["readings"][key] = {
-                    "s": {k: round(v * factor, 1) for k, v in sp.items()},
-                    "d": {k: round(v) % 360 for k, v in dr.items()},
-                }
-            elif now - t > SETTLE:
-                store["readings"][key] = {"s": {}, "d": {}}
-            print(f"  {key}  speed:{len(sp):3d}  dir:{len(dr):3d}", flush=True)
-        if b + batch_size < len(missing):
+        for i, t in enumerate(batch):
+            global_i = batch_start + i
+            pct = int((global_i + 1) / total * 40)
+            bar = "█" * pct + "░" * (40 - pct)
+            print(f"\r  [{bar}] {global_i+1:03d}/{total}  {t:%H:%M}", end="", flush=True)
+
+            sp_payload  = fetch(API_SPEED, t)
+            dir_payload = fetch(API_DIR,   t)
+
+            sp_vals,  sp_meta,  sp_unit  = extract(sp_payload)
+            dir_vals, dir_meta, dir_unit = extract(dir_payload)
+            if units["speed"] is None and sp_unit:
+                units["speed"] = sp_unit
+            if units["direction"] is None and dir_unit:
+                units["direction"] = dir_unit
+
+            # Merge station metadata from either endpoint
+            for sid, info in {**sp_meta, **dir_meta}.items():
+                if sid not in station_info:
+                    station_info[sid] = info
+
+            # Union of all station IDs seen so far
+            all_sids = set(sp_vals) | set(dir_vals) | set(speed_ts)
+            timestamps.append(t)
+
+            for sid in all_sids:
+                speed_ts.setdefault(sid, [np.nan] * global_i)
+                dir_ts.setdefault(sid,   [np.nan] * global_i)
+                speed_ts[sid].append(sp_vals.get(sid,  np.nan))
+                dir_ts[sid].append(dir_vals.get(sid, np.nan))
+
+        # Sleep between batches (not after the last one)
+        if batch_start + batch_size < total:
+            print(f"\n  [pause {WINDOW_SECS}s]", end="", flush=True)
             time.sleep(WINDOW_SECS)
 
-    store["speed_unit"] = unit
-    store["speed_display_unit"] = "km/h"
+    print()
+
+    # Pad any series shorter than timestamps (stations that appeared mid-run)
+    n = len(timestamps)
+    for sid in speed_ts:
+        while len(speed_ts[sid]) < n: speed_ts[sid].append(np.nan)
+        while len(dir_ts[sid])   < n: dir_ts[sid].append(np.nan)
+
+    # Fill in known metadata for stations the API didn't return location for
+    for sid, (name, lat, lon) in STATION_META.items():
+        if sid in speed_ts and sid not in station_info:
+            station_info[sid] = {"name": name, "lat": lat, "lon": lon}
+
+    print(f"  API-reported units — speed: {units['speed'] or 'not provided'}, "
+          f"direction: {units['direction'] or 'not provided'}")
+
+    global SPEED_UNIT_FACTOR
+    key = (units["speed"] or "").strip().lower()
+    if key in SPEED_UNIT_TO_KMH:
+        SPEED_UNIT_FACTOR = SPEED_UNIT_TO_KMH[key]
+    elif units["speed"]:
+        print(f"  ⚠ WARNING: unrecognized speed unit '{units['speed']}' from the "
+              f"API — falling back to knots (x1.852). Add it to SPEED_UNIT_TO_KMH "
+              f"in build.py if this is wrong.")
+        SPEED_UNIT_FACTOR = SPEED_UNIT_TO_KMH["knots"]
+    else:
+        print(f"  ⚠ WARNING: API did not report a speed unit — assuming knots "
+              f"(x1.852), NEA's confirmed unit as of 2026-09-12.")
+    print(f"  Using speed conversion factor: x{SPEED_UNIT_FACTOR} -> km/h")
+
+    return timestamps, speed_ts, dir_ts, station_info, units
 
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
+# ── Chart helpers ─────────────────────────────────────────────────────────────
 
-HTML = r"""<!doctype html>
+BG     = "#ffffff"
+PANEL  = "#f6f8fa"
+GRID   = "#d0d7de"
+TEXT   = "#1f2328"
+MUTED  = "#59636e"
+ACCENT = "#0969da"
+
+plt.rcParams.update({
+    "figure.facecolor": BG,   "axes.facecolor":   PANEL,
+    "axes.edgecolor":   GRID, "axes.labelcolor":  TEXT,
+    "axes.titlecolor":  TEXT, "xtick.color":      MUTED,
+    "ytick.color":      MUTED,"grid.color":       GRID,
+    "grid.linewidth":   0.6,  "text.color":       TEXT,
+    "legend.facecolor": PANEL,"legend.edgecolor": GRID,
+    "legend.labelcolor":TEXT, "font.family":      "monospace",
+    "font.size":        9,
+})
+
+
+def fig_to_b64(fig, extra_artists=None):
+    """
+    extra_artists: artists (e.g. legends added via ax.add_artist()) that
+    savefig's tight bbox calculation won't discover on its own and would
+    otherwise clip out of the saved image.
+    """
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight",
+                bbox_extra_artists=extra_artists,
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+# Confirmed live (2026-09-12): NEA's real-time wind-speed API reports in
+# knots, not m/s — this default matches that. collect() overrides it once
+# it has actually read the API's own readingUnit field for this run, so a
+# future change in what NEA reports doesn't silently produce wrong numbers.
+SPEED_UNIT_TO_KMH = {
+    "knot": 1.852, "knots": 1.852, "kt": 1.852, "kts": 1.852,
+    "m/s": 3.6, "mps": 3.6, "meter per second": 3.6, "meters per second": 3.6,
+    "metre per second": 3.6, "metres per second": 3.6,
+    "km/h": 1.0, "kmh": 1.0, "kph": 1.0,
+    "kilometer per hour": 1.0, "kilometre per hour": 1.0,
+}
+SPEED_UNIT_FACTOR = SPEED_UNIT_TO_KMH["knots"]
+
+
+def speed_to_kmh(v):
+    """Convert a raw NEA speed reading to km/h using SPEED_UNIT_FACTOR."""
+    return np.array(v, dtype=float) * SPEED_UNIT_FACTOR
+
+
+def mean_uv(speed, direction):
+    """
+    Decompose each (speed, direction) reading into u/v (eastward/northward)
+    components and average those. Returns (u_mean, v_mean), both nan if no
+    minute has both a speed and a direction reading.
+    """
+    speed = np.array(speed, dtype=float)
+    direction = np.array(direction, dtype=float)
+    ok = ~np.isnan(speed) & ~np.isnan(direction)
+    if not ok.any():
+        return np.nan, np.nan
+    r = np.radians(direction[ok])
+    u = -speed[ok] * np.sin(r)
+    v = -speed[ok] * np.cos(r)
+    return float(np.mean(u)), float(np.mean(v))
+
+
+def vector_mean_wind(speed, direction):
+    """
+    Average wind speed + direction (met bearing, FROM) by decomposing each
+    reading into u/v components (see mean_uv), then recombining the averaged
+    components back into a resultant speed and direction. This is the
+    standard vector-mean wind: a calm, directionally-erratic minute barely
+    moves the average, unlike separately arithmetic-averaging speed and
+    circular-averaging direction, where every minute's direction counts
+    equally regardless of how weak the wind was.
+
+    Returns (mean_speed, mean_dir); both nan if no valid readings.
+    """
+    u_mean, v_mean = mean_uv(speed, direction)
+    if np.isnan(u_mean):
+        return np.nan, np.nan
+    mean_speed = math.hypot(u_mean, v_mean)
+    mean_dir = math.degrees(math.atan2(-u_mean, -v_mean)) % 360
+    return mean_speed, mean_dir
+
+
+def bearing_arrow(deg):
+    """
+    Return (dx, dy) unit vector — in standard (east=+x, north=+y) axes —
+    pointing the way the wind is blowing TOWARD. `deg` is the met-bearing
+    the wind blows FROM (standard convention, matching the raw NEA
+    reading): a vector aimed at bearing b is (sin b, cos b), and the
+    travel direction is (deg + 180), so this simplifies to (-sin, -cos).
+    """
+    r = math.radians(deg)
+    return -math.sin(r), -math.cos(r)
+
+
+# Common words in NEA station names, abbreviated so chart legends stay compact.
+_NAME_ABBREVIATIONS = [
+    ("Avenue", "Ave"), ("Boulevard", "Blvd"), ("Highway", "Hwy"),
+    ("Gardens", "Gdns"), ("Drive", "Dr"), ("Street", "St"), ("Road", "Rd"),
+    ("Upper", "Up"), ("North", "N"), ("South", "S"), ("East", "E"), ("West", "W"),
+]
+
+
+def shorten_name(name, max_len=18):
+    """Abbreviate common words in a station name, then hard-truncate if still too long."""
+    short = name
+    for full, abbr in _NAME_ABBREVIATIONS:
+        short = re.sub(rf"\b{full}\b", abbr, short)
+    if len(short) > max_len:
+        short = short[:max_len - 1].rstrip() + "…"
+    return short
+
+
+# Rough geometric region classifier (Singapore has no single station->region
+# lookup that's reliably available from the API), used to group the time
+# series legend. SG_CENTER is close to the geographic centroid of the island.
+SG_CENTER_LAT, SG_CENTER_LON = 1.3521, 103.8198
+SG_CENTRAL_RADIUS_DEG = 0.045
+REGION_ORDER = ["North", "East", "South", "West", "Central"]
+
+
+def region_of(lat, lon):
+    dlat = lat - SG_CENTER_LAT
+    dlon = lon - SG_CENTER_LON
+    if math.hypot(dlat, dlon) < SG_CENTRAL_RADIUS_DEG:
+        return "Central"
+    if abs(dlat) >= abs(dlon):
+        return "North" if dlat > 0 else "South"
+    return "East" if dlon > 0 else "West"
+
+
+# ── Chart 1: Speed time series, one small-multiple panel per region ──────────
+
+def chart_spaghetti(timestamps, speed_ts, station_info):
+    t_arr = np.array(timestamps)
+
+    sids_by_region = {r: [] for r in REGION_ORDER}
+    for sid in sorted(speed_ts):
+        info = station_info.get(sid, {})
+        lat = info.get("lat") or SG_CENTER_LAT
+        lon = info.get("lon") or SG_CENTER_LON
+        sids_by_region[region_of(lat, lon)].append(sid)
+
+    active_regions = [r for r in REGION_ORDER if sids_by_region[r]]
+    n = max(len(active_regions), 1)
+    ncols = min(3, n)
+    nrows = math.ceil(n / ncols)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.6 * ncols, 3.8 * nrows),
+                              sharex=True, sharey=True, squeeze=False)
+    fig.patch.set_facecolor(BG)
+    axes_flat = axes.flatten()
+
+    for idx, region in enumerate(active_regions):
+        ax = axes_flat[idx]
+        sids = sids_by_region[region]
+        cmap = matplotlib.colormaps["tab10"].resampled(len(sids))
+        for i, sid in enumerate(sids):
+            spd = speed_to_kmh(speed_ts[sid])
+            name = station_info.get(sid, {}).get("name", sid)
+            ax.plot(t_arr, spd, color=cmap(i), lw=1.3, alpha=0.85,
+                    label=shorten_name(name))
+
+        ax.set_title(region, fontsize=10, fontweight="bold")
+        locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+        ax.tick_params(axis="x", rotation=45, labelsize=7)
+        ax.grid(True, ls="--", alpha=0.4)
+        ax.legend(fontsize=6.5, loc="upper right", framealpha=0.8, handlelength=1.2)
+
+    # Hide any unused trailing cells (grid may have more slots than regions).
+    for j in range(len(active_regions), len(axes_flat)):
+        axes_flat[j].axis("off")
+
+    fig.supxlabel("Time (SGT)", fontsize=9)
+    fig.supylabel("km/h", fontsize=9)
+    fig.suptitle(f"Wind Speed by Region  |  {PERIOD_LABEL}", fontsize=12)
+    fig.tight_layout(rect=[0.01, 0.01, 1, 0.94])
+    return fig_to_b64(fig)
+
+
+# ── Chart 2: Station ranking (mean speed + direction arrow) ──────────────────
+
+def chart_ranking(speed_ts, dir_ts, station_info):
+    rows = []
+    for sid, spd_raw in speed_ts.items():
+        spd = speed_to_kmh(spd_raw)
+        valid_spd = spd[~np.isnan(spd)]
+        if len(valid_spd) == 0: continue
+        dirs = np.array(dir_ts.get(sid, []), dtype=float)
+        mean_spd, mean_dir = vector_mean_wind(spd, dirs)
+        rows.append({
+            "sid":  sid,
+            "name": station_info.get(sid, {}).get("name", sid),
+            "mean": mean_spd,
+            "max":  float(np.nanmax(spd)),
+            "dir":  mean_dir,
+        })
+    rows.sort(key=lambda r: r["mean"], reverse=True)
+
+    fig, ax = plt.subplots(figsize=(10, max(4, len(rows) * 0.45)))
+    fig.patch.set_facecolor(BG)
+
+    y     = range(len(rows))
+    means = [r["mean"] for r in rows]
+    maxes = [r["max"]  for r in rows]
+    cmap  = matplotlib.colormaps["YlOrRd"]
+    norm  = Normalize(vmin=0, vmax=max(maxes) if maxes else 1)
+
+    ax.barh(list(y), maxes,  color=[cmap(norm(m)*0.5+0.15) for m in maxes],
+            alpha=0.35, label="max")
+    ax.barh(list(y), means,  color=[cmap(norm(m)) for m in means],
+            alpha=0.9, label="mean")
+
+    # Direction arrows
+    for yi, row in enumerate(rows):
+        if not np.isnan(row["dir"]):
+            dx, dy = bearing_arrow(row["dir"])
+            ax.annotate("", xy=(row["mean"] + dx*1.5, yi + dy*0.25),
+                        xytext=(row["mean"], yi),
+                        arrowprops=dict(arrowstyle="->", color=ACCENT, lw=1.2))
+
+    labels = [f"{r['name']} ({r['sid']})" for r in rows]
+    ax.set_yticks(list(y))
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xlabel("km/h")
+    ax.set_title(f"Station Rankings (mean speed) — {PERIOD_LABEL}", fontsize=11, pad=8)
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(True, ls="--", alpha=0.4, axis="x")
+    ax.invert_yaxis()
+    fig.tight_layout()
+    return fig_to_b64(fig)
+
+
+# ── Map: pannable Leaflet map of Singapore ───────────────────────────────────
+
+def build_map_data(speed_ts, dir_ts, station_info):
+    """
+    Build the per-station records the Leaflet map renders client-side.
+    Bubble size/colour = mean speed, arrow = direction the wind is blowing toward.
+    """
+    rows = []
+    for sid, spd_raw in speed_ts.items():
+        info = station_info.get(sid)
+        if not info or info["lat"] == 0: continue
+        spd = speed_to_kmh(spd_raw)
+        valid_spd = spd[~np.isnan(spd)]
+        if len(valid_spd) == 0: continue
+        dirs = np.array(dir_ts.get(sid, []), dtype=float)
+        mean_spd, mean_dir = vector_mean_wind(spd, dirs)
+        if np.isnan(mean_spd): continue  # no minute had both a speed and a direction reading
+        rows.append({
+            "sid":      sid,
+            "name":     info["name"],
+            "lat":      info["lat"],
+            "lon":      info["lon"],
+            "mean_spd": round(mean_spd, 2),
+            "mean_dir": round(mean_dir, 1),
+        })
+    return rows
+
+
+# Grid extent for the convergence field — a bit wider than the station
+# spread so the interpolation/overlay covers the whole visible basemap.
+CONV_LAT_MIN, CONV_LAT_MAX = 1.16, 1.48
+CONV_LON_MIN, CONV_LON_MAX = 103.58, 104.10
+CONV_BOUNDS = [[CONV_LAT_MIN, CONV_LON_MIN], [CONV_LAT_MAX, CONV_LON_MAX]]
+# Deliberately coarse: fine enough to show spatial structure, coarse enough
+# that each grid cell is a visually distinct tile with its own border.
+CONV_GRID_N = 25
+
+
+def build_convergence_field(speed_ts, dir_ts, station_info, grid_n=CONV_GRID_N):
+    """
+    Interpolate station-mean u/v wind components onto a regular lat/lon
+    grid (inverse-distance weighting), then compute the horizontal wind
+    convergence of the interpolated field: convergence = -(du/dx + dv/dy).
+
+    Positive convergence = air piling up (favours uplift/showers);
+    negative = divergence (air spreading out).
+
+    Returns a 2D array (grid_n x grid_n, row 0 = CONV_LAT_MIN) of
+    convergence in units of 1e-4 s^-1, or None if fewer than 3 stations
+    have a usable wind vector.
+    """
+    lats, lons, us, vs = [], [], [], []
+    for sid, spd_raw in speed_ts.items():
+        info = station_info.get(sid)
+        if not info or info["lat"] == 0: continue
+        spd = speed_to_kmh(spd_raw)
+        dirs = np.array(dir_ts.get(sid, []), dtype=float)
+        u, v = mean_uv(spd, dirs)
+        if np.isnan(u): continue
+        lats.append(info["lat"]); lons.append(info["lon"])
+        us.append(u); vs.append(v)
+
+    if len(lats) < 3:
+        return None
+
+    lats, lons = np.array(lats), np.array(lons)
+    us, vs = np.array(us), np.array(vs)
+
+    grid_lat = np.linspace(CONV_LAT_MIN, CONV_LAT_MAX, grid_n)
+    grid_lon = np.linspace(CONV_LON_MIN, CONV_LON_MAX, grid_n)
+    glon, glat = np.meshgrid(grid_lon, grid_lat)  # both (grid_n, grid_n)
+
+    # Nearest-neighbor interpolation: each grid point takes the u/v from
+    # the closest station, preserving sharp edges without smoothing.
+    flat_glat = glat.ravel()
+    flat_glon = glon.ravel()
+    d2 = ((lats[:, None] - flat_glat[None, :]) ** 2 +
+          (lons[:, None] - flat_glon[None, :]) ** 2)
+    nearest_idx = np.argmin(d2, axis=0)
+    u_grid = us[nearest_idx].reshape(glat.shape)
+    v_grid = vs[nearest_idx].reshape(glat.shape)
+
+    # Degree spacing -> metres, so the gradient is a physically-scaled s^-1 rate.
+    mean_lat_rad = math.radians(np.mean(lats))
+    dx_m = (grid_lon[1] - grid_lon[0]) * 111_320 * math.cos(mean_lat_rad)
+    dy_m = (grid_lat[1] - grid_lat[0]) * 110_540
+
+    du_dx = np.gradient(u_grid / 3.6, dx_m, axis=1)  # km/h -> m/s first
+    dv_dy = np.gradient(v_grid / 3.6, dy_m, axis=0)
+    convergence = -(du_dx + dv_dy) * 1e4  # x1e-4 s^-1, a typical display scale
+    return convergence
+
+
+def render_convergence_overlay(convergence):
+    """
+    Render the convergence field as a transparent PNG for a Leaflet image
+    overlay: a mosaic of visibly-separated grid cells (not a smoothed
+    blob), so the interpolation grid itself is legible. Red = convergence,
+    blue = divergence. Colour always spans the full range of that hour's
+    field (TwoSlopeNorm rescales to the field's own min/max each time), and
+    opacity is a fixed constant rather than scaled by magnitude — so the
+    overlay stays visible even in a calm hour with only weak convergence.
+    """
+    n_lat, n_lon = convergence.shape
+    grid_lat = np.linspace(CONV_LAT_MIN, CONV_LAT_MAX, n_lat)
+    grid_lon = np.linspace(CONV_LON_MIN, CONV_LON_MAX, n_lon)
+    glon, glat = np.meshgrid(grid_lon, grid_lat)
+
+    fig = plt.figure(figsize=(6, 6), dpi=150)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    fig.patch.set_alpha(0)
+
+    vmax = max(float(np.nanmax(np.abs(convergence))), 1e-6)
+    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+    cmap = matplotlib.colormaps["RdBu_r"]
+
+    # imshow with nearest-neighbor interpolation renders grid cells as
+    # sharp tiles with no smoothing or blur between cells.
+    ax.imshow(convergence, cmap=cmap, norm=norm, alpha=0.65,
+              extent=[CONV_LON_MIN, CONV_LON_MAX, CONV_LAT_MIN, CONV_LAT_MAX],
+              origin="upper", interpolation="nearest")
+    ax.set_xlim(CONV_LON_MIN, CONV_LON_MAX)
+    ax.set_ylim(CONV_LAT_MIN, CONV_LAT_MAX)
+    ax.set_aspect("auto")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", transparent=True)
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode(), vmax
+
+
+# ── Summary table ─────────────────────────────────────────────────────────────
+
+def build_table(speed_ts, dir_ts, station_info):
+    rows = []
+    for sid, spd_raw in speed_ts.items():
+        spd  = speed_to_kmh(spd_raw)
+        dirs = np.array(dir_ts.get(sid, []), dtype=float)
+        vs   = spd[~np.isnan(spd)]
+        if len(vs) == 0: continue
+        mean_spd, mean_dir = vector_mean_wind(spd, dirs)
+        rows.append({
+            "sid":     sid,
+            "name":    station_info.get(sid, {}).get("name", "—"),
+            "mean":    f"{mean_spd:.1f}" if not np.isnan(mean_spd) else "—",
+            "max":     f"{np.nanmax(spd):.1f}",
+            "min":     f"{np.nanmin(spd):.1f}",
+            "dir":     f"{mean_dir:.0f}°" if not np.isnan(mean_dir) else "—",
+            "missing": int(np.sum(np.isnan(spd))),
+            "n":       len(spd),
+        })
+    rows.sort(key=lambda r: float(r["mean"]) if r["mean"] != "—" else -1.0, reverse=True)
+
+    tr = "\n".join(
+        f"""<tr>
+          <td>{r['sid']}</td><td>{r['name']}</td>
+          <td class="num">{r['mean']}</td>
+          <td class="num">{r['max']}</td>
+          <td class="num">{r['min']}</td>
+          <td class="num">{r['dir']}</td>
+          <td class="num">{r['missing']}/{r['n']}</td>
+        </tr>""" for r in rows)
+    return tr
+
+
+# ── HTML template ─────────────────────────────────────────────────────────────
+
+HTML = """\
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Singapore Wind – Past 24 Hours</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SG Wind Report — {period_label}</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
-  :root {
-    color-scheme: light;
-    --bg: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --muted: #52514e;
-    --faint: #898781; --grid: #e1e0d9; --border: rgba(11,11,11,0.10);
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      color-scheme: dark;
-      --bg: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --muted: #c3c2b7;
-      --faint: #898781; --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
-    }
-  }
-  * { box-sizing: border-box; }
-  [hidden] { display: none !important; }
-  body { margin: 0; background: var(--bg); color: var(--ink);
-         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
-  main { max-width: 900px; margin: 0 auto; padding: 20px 16px 40px; }
-  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-  h1 { font-size: 1.4rem; margin: 0 0 4px; }
-  .subtitle { color: var(--muted); font-size: 0.9rem; margin: 0 0 12px; }
-  button { font: inherit; font-size: 0.8rem; padding: 6px 10px; border-radius: 6px;
-           border: 1px solid var(--border); background: var(--surface); color: var(--ink); cursor: pointer; }
-  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px;
-             font-size: 0.8rem; color: var(--muted); }
-  .toolbar .spacer { flex: 1; }
-  .chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-                padding: 10px 12px 4px; }
-  .panel-title { font-size: 0.85rem; color: var(--muted); text-align: center; margin: 2px 0 4px; }
-  svg.chart { width: 100%; height: auto; display: block; touch-action: pan-y; cursor: grab;
-              user-select: none; -webkit-user-select: none; }
-  svg.chart.dragging { cursor: grabbing; }
-  .axis-label { font-size: 10px; fill: var(--faint); }
-  .tooltip { position: fixed; pointer-events: none; background: var(--ink); color: var(--bg);
-             font-size: 0.78rem; padding: 6px 9px; border-radius: 6px; line-height: 1.5;
-             z-index: 20; white-space: nowrap; }
-  .tooltip .row { display: flex; gap: 10px; justify-content: space-between; }
-  .tooltip .row .k { opacity: 0.85; }
-  .tooltip .row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
-  .tooltip .sep { border-top: 1px solid currentColor; opacity: 0.3; margin: 3px 0; }
-  .panel { margin-top: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
-  summary { padding: 10px 12px; cursor: pointer; font-weight: 600; }
-  .bar { padding: 0 12px 8px; display: flex; gap: 8px; flex-wrap: wrap; }
-  .group { padding: 0 12px 10px; }
-  .ghead { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
-  .ghead h3 { margin: 0; font-size: 13px; flex: 1; }
-  .ghead button { padding: 3px 9px; font-size: 12px; }
-  .chips { display: grid; gap: 6px; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); }
-  .chip { display: flex; align-items: center; gap: 8px; padding: 8px 10px; min-height: 38px;
-          text-align: left; border-radius: 20px; font-size: 13px; }
-  .chip i { width: 12px; height: 12px; border-radius: 50%; flex: none; }
-  .chip.avg { font-weight: 600; border-width: 2px; }
-  .chip.off { opacity: .45; }
-  .chip.off i { background: transparent !important; border: 2px solid var(--faint); }
-  .hint { margin-top: 12px; color: var(--muted); font-size: 0.78rem; line-height: 1.5; }
-  .empty-state { color: var(--muted); font-size: 0.9rem; padding: 24px 0; text-align: center; }
-
-  .tabs { display: flex; gap: 6px; margin: 0 0 12px; }
-  .tabs button { flex: 1; padding: 10px 8px; font-size: 0.9rem; font-weight: 600; }
-  .tabs button[aria-selected="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
-  .view.is-off { display: none; }
-  .map-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px 12px; }
-  .map-title { font-size: 0.95rem; font-weight: 600; margin: 0; }
-  .map-sub { font-size: 0.8rem; color: var(--muted); margin: 2px 0 8px; }
-  .map-wrap { position: relative; width: 100%; }
-  #mapCanvas { width: 100%; display: block; border-radius: 6px; touch-action: pan-y; cursor: crosshair; }
-  .legend { margin: 8px 0 2px; }
-  .legend-bar { height: 10px; border-radius: 5px; border: 1px solid var(--border); }
-  .legend-ticks { display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--muted); margin-top: 2px;
-                  font-variant-numeric: tabular-nums; }
-  .legend-cap { font-size: 0.72rem; color: var(--faint); margin-top: 2px; }
-  .slider-row { display: flex; align-items: center; gap: 6px; margin: 10px 0 6px; }
-  .slider-row input[type=range] { flex: 1; min-width: 0; height: 36px; margin: 0; }
-  .slider-row button { padding: 8px 10px; min-width: 40px; font-weight: 600; }
-  .seg { display: flex; gap: 6px; margin: 6px 0; flex-wrap: wrap; }
-  .seg button { flex: 1; padding: 8px 6px; }
-  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
-  .opts { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 8px 0 2px; font-size: 0.82rem; }
-  .opts label { display: flex; align-items: center; gap: 6px; min-height: 30px; cursor: pointer; }
-  .map-info { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border);
-              font-size: 0.82rem; line-height: 1.5; min-height: 3.2em; }
-  .band { fill: var(--ink); opacity: 0.08; pointer-events: none; }
-  @media (min-width: 1100px) {
-    main { max-width: 1320px; }
-    .tabs { display: none; }
-    .views { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 16px; align-items: start; }
-    .view.is-off { display: block; }
-  }
-  @media (max-width: 640px) {
-    main { padding: 12px 8px 30px; }
-    h1 { font-size: 1.2rem; }
-    .chips { grid-template-columns: 1fr 1fr; }
-    .chip { font-size: 12px; padding: 6px 8px; border-radius: 10px; }
-    .group { padding: 0 8px 8px; }
-  }
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#ffffff;color:#1f2328;font-family:'Courier New',monospace;
+        font-size:14px;line-height:1.6;padding:0 0 60px}}
+  header{{background:#f6f8fa;border-bottom:1px solid #d0d7de;
+          padding:20px 32px;position:sticky;top:0;z-index:10}}
+  header h1{{font-size:1.2rem;font-weight:700;color:#0969da}}
+  header p{{color:#59636e;font-size:.85rem;margin-top:4px}}
+  nav{{display:flex;gap:16px;margin-top:12px;flex-wrap:wrap}}
+  nav a{{color:#59636e;text-decoration:none;font-size:.8rem;
+          padding:3px 8px;border:1px solid #d0d7de;border-radius:4px}}
+  nav a:hover{{color:#1f2328;border-color:#0969da}}
+  main{{max-width:1200px;margin:0 auto;padding:32px 24px}}
+  section{{margin-bottom:48px}}
+  h2{{font-size:1rem;color:#59636e;text-transform:uppercase;
+       letter-spacing:.08em;margin-bottom:16px;padding-bottom:6px;
+       border-bottom:1px solid #d0d7de}}
+  .chart-wrap{{background:#f6f8fa;border:1px solid #d0d7de;
+               border-radius:8px;overflow:hidden;padding:8px}}
+  .chart-wrap img{{width:100%;height:auto;display:block}}
+  .map-wrap{{background:#f6f8fa;border:1px solid #d0d7de;
+             border-radius:8px;overflow:hidden}}
+  #leaflet-map{{height:520px;width:100%;background:#f6f8fa}}
+  .wind-arrow{{color:#0969da;font-size:18px;line-height:20px;text-align:center;
+               text-shadow:0 0 3px #fff;pointer-events:none}}
+  .leaflet-popup-content-wrapper{{background:#ffffff;color:#1f2328;
+               border:1px solid #d0d7de;font-family:'Courier New',monospace}}
+  .leaflet-popup-tip{{background:#ffffff}}
+  .leaflet-container a.leaflet-popup-close-button{{color:#59636e}}
+  .leaflet-control-zoom a{{background:#ffffff;color:#1f2328;border-color:#d0d7de}}
+  .leaflet-control-attribution{{background:rgba(255,255,255,.85);color:#59636e}}
+  .leaflet-control-attribution a{{color:#0969da}}
+  .conv-scale{{max-width:420px;margin-bottom:16px}}
+  .conv-gradient{{height:14px;border-radius:3px;border:1px solid #d0d7de;
+    background:linear-gradient(to right,#053061,#2166ac,#4393c3,#92c5de,#d1e5f0,
+                #f7f7f7,#fddbc7,#f4a582,#d6604d,#b2182b,#67001f)}}
+  .conv-scale-labels{{display:flex;justify-content:space-between;font-size:.72rem;
+                       color:#59636e;margin-top:3px}}
+  .conv-scale-caption{{font-size:.72rem;color:#59636e;margin-top:2px}}
+  .table-scroll{{max-height:480px;overflow:auto;border:1px solid #d0d7de;
+                 border-radius:8px}}
+  table{{width:100%;border-collapse:collapse;font-size:.82rem}}
+  th{{background:#eaeef2;color:#59636e;padding:8px 12px;
+      text-align:left;font-weight:600;position:sticky;top:0}}
+  td{{padding:7px 12px;border-bottom:1px solid #eaeef2}}
+  td.num{{text-align:right;font-variant-numeric:tabular-nums}}
+  tr:hover td{{background:#f6f8fa}}
+  .badge{{display:inline-block;padding:2px 6px;border-radius:3px;
+           font-size:.75rem;background:#eaeef2;color:#59636e;margin-left:8px}}
+  footer{{text-align:center;color:#6e7781;font-size:.75rem;margin-top:40px}}
 </style>
 </head>
 <body>
-<main>
-  <header>
-    <div>
-      <h1>Singapore wind &ndash; past 24 hours</h1>
-      <p class="subtitle" id="subtitle"></p>
-    </div>
-  </header>
-
-  <nav class="tabs" role="tablist" aria-label="View">
-    <button type="button" role="tab" id="tab-ts" aria-selected="true">Time series</button>
-    <button type="button" role="tab" id="tab-map" aria-selected="false">Convergence map</button>
+<header>
+  <h1>Singapore Wind Report</h1>
+  <p>{period_label} &nbsp;·&nbsp;
+     {n_stations} stations &nbsp;·&nbsp; {n_minutes} minutes
+     <span class="badge">NEA / data.gov.sg</span></p>
+  <nav>
+    <a href="#map">Map</a>
+    <a href="#timeseries">Time Series</a>
+    <a href="#ranking">Rankings</a>
+    <a href="#table">Data Table</a>
   </nav>
+</header>
+<main>
 
-<div class="views">
-<section class="view" id="view-ts">
-  <div class="toolbar">
-    <button id="zout" type="button" aria-label="Zoom out">&minus;</button>
-    <button id="zin" type="button" aria-label="Zoom in">+</button>
-    <button data-hours="3" type="button">3h</button>
-    <button data-hours="6" type="button">6h</button>
-    <button data-hours="12" type="button">12h</button>
-    <button data-hours="24" type="button">24h</button>
-    <span class="spacer"></span>
-    <button id="reset" type="button">Reset view</button>
-  </div>
-
-  <div class="chart-card" id="card">
-    <div class="panel-title">Wind speed (km/h) &mdash; thick lines are each region's vector-mean wind</div>
-    <svg class="chart" id="chart-speed"></svg>
-    <div class="panel-title">Wind direction (&deg;, the bearing the wind blows from)</div>
-    <svg class="chart" id="chart-dir"></svg>
-  </div>
-
-  <details class="panel" id="stationPanel" open>
-    <summary>Stations</summary>
-    <div class="bar">
-      <button id="all" type="button">Show all</button>
-      <button id="none" type="button">Hide all</button>
-    </div>
-    <div id="chips"></div>
-  </details>
-
-  <div class="hint" id="hint"></div>
+<section id="map">
+  <h2>Geographic Overview</h2>
+  <p style="color:#59636e;font-size:.82rem;margin-bottom:8px">
+    Drag to pan, scroll or use the +/- controls to zoom. Circles: size and colour = mean
+    wind speed, arrow = direction the wind is blowing toward. Shaded grid overlay: wind
+    convergence, interpolated from station wind vectors (u/v averaged onto a grid, then
+    the grid's divergence computed) — each tile is one grid cell.
+  </p>
+  {conv_scale}
+  <div class="map-wrap"><div id="leaflet-map"></div></div>
 </section>
 
-<section class="view is-off" id="view-map">
-  <div class="map-card">
-    <p class="map-title" id="mapTitle"></p>
-    <p class="map-sub" id="mapSub"></p>
-    <div id="mapEmpty" class="empty-state" hidden>No convergence data yet.</div>
-    <div id="mapBody">
-      <div class="map-wrap" id="mapWrap"><canvas id="mapCanvas" aria-label="Wind convergence map of Singapore"></canvas></div>
-      <div class="legend">
-        <div class="legend-bar" id="legBar"></div>
-        <div class="legend-ticks" id="legTicks"></div>
-        <div class="legend-cap" id="legCap"></div>
-      </div>
-      <div class="slider-row">
-        <button type="button" id="hPrev" aria-label="Previous hour">&#9664;</button>
-        <input type="range" id="hSlider" min="0" max="0" step="1" value="0" aria-label="Hour">
-        <button type="button" id="hNext" aria-label="Next hour">&#9654;</button>
-        <button type="button" id="hPlay" aria-label="Play">Play</button>
-        <button type="button" id="hLatest">Latest</button>
-      </div>
-      <div class="seg" id="layerSeg">
-        <button type="button" data-layer="mean" aria-pressed="true">Hourly mean</button>
-        <button type="button" data-layer="peak" aria-pressed="false">Hourly peak</button>
-        <button type="button" data-layer="pers" aria-pressed="false">Persistence</button>
-      </div>
-      <div class="seg" id="winSeg" hidden>
-        <button type="button" data-win="3" aria-pressed="true">Last 3 h</button>
-        <button type="button" data-win="6" aria-pressed="false">Last 6 h</button>
-        <button type="button" data-win="24" aria-pressed="false">Last 24 h</button>
-      </div>
-      <div class="opts">
-        <label><input type="checkbox" id="optArrows" checked> Wind arrows</label>
-        <label><input type="checkbox" id="optStn" checked> Stations</label>
-        <label id="optBaseWrap"><input type="checkbox" id="optBase"> Add back the fixed 24 h pattern</label>
-      </div>
-      <div class="map-info" id="mapInfo">Tap the map for values at a point.</div>
-    </div>
-  </div>
-  <div class="hint" id="mapHint"></div>
+<section id="timeseries">
+  <h2>Speed Time Series — By Region</h2>
+  <div class="chart-wrap"><img src="data:image/png;base64,{img_spag}" alt="time series"></div>
 </section>
-</div>
+
+<section id="ranking">
+  <h2>Station Rankings</h2>
+  <p style="color:#59636e;font-size:.82rem;margin-bottom:12px">
+    Bars show mean (solid) and max (translucent). Blue arrow = direction the wind is blowing toward.
+  </p>
+  <div class="chart-wrap"><img src="data:image/png;base64,{img_rank}" alt="rankings"></div>
+</section>
+
+<section id="table">
+  <h2>Summary Table</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr>
+      <th>Station ID</th><th>Name</th>
+      <th style="text-align:right">Mean (km/h)</th>
+      <th style="text-align:right">Max (km/h)</th>
+      <th style="text-align:right">Min (km/h)</th>
+      <th style="text-align:right">Mean Dir</th>
+      <th style="text-align:right">Missing</th>
+    </tr></thead>
+    <tbody>{table_rows}</tbody>
+  </table>
+  </div>
+</section>
+
 </main>
-
-<div class="tooltip" id="tooltip" hidden></div>
-
+<footer>
+  Generated by GitHub Actions · Source: NEA / data.gov.sg (Open Data Licence) ·
+  Report period: {period_label} · Built {built}<br>
+  API-reported units — speed: {speed_unit}, direction: {direction_unit}
+</footer>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
-(function () {
-  "use strict";
-
-  var STORE = __DATA__;
-  var COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
-  var REGION_COLORS = { North: "#d62728", West: "#1f4e9c", Central: "#8e24aa", East: "#e08a00", South: "#0b8f6a" };
-  var MARGIN = { top: 10, right: 12, bottom: 6, left: 44 };
-  var BOTTOM_AXIS_H = 28;
-  var H_SPEED = 250, H_DIR = 230;
-  var MIN_SPAN_MS = 20 * 60 * 1000;
-  var TAP_MAX_MOVE_PX = 8;
-  var MIN_PX_PER_TICK = 62;
-  var STEP_CANDIDATES_MS = [5, 10, 15, 30, 60, 120, 180, 360, 720, 1440].map(function (m) { return m * 60000; });
-  var DAY_MS = 86400000;
-
-  // Readings are stored as SGT wall-clock strings; parse them as UTC and
-  // format with timeZone "UTC" so the wall-clock time is shown unchanged.
-  function toMs(s) { return Date.parse(s + ":00Z"); }
-  function fmt(ms, opts) {
-    return new Intl.DateTimeFormat("en-GB", Object.assign({ timeZone: "UTC" }, opts)).format(new Date(ms));
-  }
-  var fmtHM = function (ms) { return fmt(ms, { hour: "2-digit", minute: "2-digit", hour12: false }); };
-  var fmtDay = function (ms) { return fmt(ms, { day: "numeric", month: "short" }); };
-  var compass = function (d) { return COMPASS[Math.round(d / 22.5) % 16]; };
-
-  var els = {};
-  var state = { width: 860, viewDomain: null, fullDomain: null, panels: [], pinned: false };
-
-  var times = Object.keys(STORE.readings).sort();
-  var tms = times.map(toMs);
-  var rank = function (id) { return STORE.regions.indexOf(STORE.stations[id].region); };
-  var ids = Object.keys(STORE.stations).sort(function (a, b) {
-    return rank(a) - rank(b) || STORE.stations[a].name.localeCompare(STORE.stations[b].name);
-  });
-
-  function readings(t, key, id) { var r = (STORE.readings[t] || {})[key]; return r && r[id] != null ? r[id] : null; }
-
-  var stations = ids.map(function (id, i) {
-    return {
-      id: id, name: STORE.stations[id].name, region: STORE.stations[id].region,
-      color: "hsl(" + ((i * 137.5) % 360) + " 65% 48%)", on: true, isAvg: false,
-      sp: times.map(function (t) { return readings(t, "s", id); }),
-      dr: times.map(function (t) { return readings(t, "d", id); })
-    };
-  });
-
-  // Vector-mean wind per region and time step: average the u/v components of
-  // every station reporting both speed and direction, then convert back.
-  var activeRegions = STORE.regions.filter(function (r) {
-    return ids.some(function (id) { return STORE.stations[id].region === r; });
-  });
-  var averages = activeRegions.map(function (region) {
-    var members = ids.filter(function (id) { return STORE.stations[id].region === region; });
-    var s = { name: region + " average", region: region, color: REGION_COLORS[region], on: true, isAvg: true,
-              sp: [], dr: [], cnt: [] };
-    times.forEach(function (t) {
-      var u = 0, v = 0, n = 0;
-      members.forEach(function (id) {
-        var sp = readings(t, "s", id), d = readings(t, "d", id);
-        if (sp == null || d == null) return;
-        var rad = d * Math.PI / 180;
-        u += -sp * Math.sin(rad); v += -sp * Math.cos(rad); n++;
-      });
-      if (!n) { s.sp.push(null); s.dr.push(null); s.cnt.push(0); return; }
-      u /= n; v /= n;
-      s.sp.push(Math.round(Math.hypot(u, v) * 10) / 10);
-      s.dr.push(Math.round((Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360) % 360);
-      s.cnt.push(n);
-    });
-    return s;
-  });
-  var allSeries = stations.concat(averages);
-
-  document.addEventListener("DOMContentLoaded", init);
-  window.addEventListener("hourselect", function (e) {
-    state.hourBand = e.detail ? [e.detail.start, e.detail.end] : null;
-    if (state.panels.length) renderAll();
-  });
-  window.addEventListener("tabshown", function (e) {
-    if (e.detail === "ts" && state.panels.length) { measureWidth(); renderAll(); }
-  });
-
-  function init() {
-    els.subtitle = document.getElementById("subtitle");
-    els.tooltip = document.getElementById("tooltip");
-    var have = times.filter(function (t) { return Object.keys(STORE.readings[t].s || {}).length; }).length;
-    els.subtitle.textContent = ids.length + " stations · " + have + "/" + times.length + " slots · " +
-      (times.length ? times[0].replace("T", " ") + " → " + times[times.length - 1].replace("T", " ") + " SGT" : "no data yet");
-
-    if (!times.length) {
-      var p = document.createElement("p");
-      p.className = "empty-state"; p.textContent = "No wind data yet.";
-      document.getElementById("card").replaceWith(p);
-      return;
-    }
-
-    state.fullDomain = [tms[0], tms[tms.length - 1]];
-    state.viewDomain = state.fullDomain.slice();
-
-    var touch = matchMedia("(pointer: coarse)").matches;
-    document.getElementById("hint").innerHTML = touch
-      ? "Swipe sideways on a chart to pan, vertically to scroll the page; use the &minus;/+ and 3h/6h/12h/24h buttons to zoom. Tap a point for readings. Speed in km/h; direction is the bearing the wind blows <em>from</em>."
-      : "Drag to pan, scroll or pinch to zoom, click to pin the readings, hover for exact values. Thick lines and dots are the vector-mean wind of each region. Speed in km/h; direction is the bearing the wind blows <em>from</em>.";
-
-    document.getElementById("zin").onclick = function () { zoomBy(0.5); };
-    document.getElementById("zout").onclick = function () { zoomBy(2); };
-    document.getElementById("reset").onclick = resetView;
-    document.querySelectorAll(".toolbar [data-hours]").forEach(function (b) {
-      b.onclick = function () {
-        var h = +b.dataset.hours, hi = state.fullDomain[1];
-        state.viewDomain = clampViewDomain([hi - h * 3600000, hi]);
-        dismissPinned(); renderAll();
-      };
-    });
-    window.addEventListener("resize", debounce(function () { measureWidth(); renderAll(); }, 150));
-    document.addEventListener("pointerdown", function (evt) {
-      if (!state.pinned) return;
-      if (evt.target.closest && evt.target.closest(".chart-card")) return;
-      dismissPinned();
-    });
-
-    buildChips();
-    if (innerWidth <= 640) document.getElementById("stationPanel").open = false;
-    measureWidth();
-    buildPanel("chart-speed", false);
-    buildPanel("chart-dir", true);
-    renderAll();
-  }
-
-  function debounce(fn, ms) {
-    var t;
-    return function () { clearTimeout(t); t = setTimeout(fn, ms); };
-  }
-  function measureWidth() { state.width = Math.max(280, document.getElementById("card").clientWidth - 24); }
-  function dismissPinned() {
-    state.pinned = false; els.tooltip.hidden = true;
-    state.panels.forEach(function (p) { if (p.crosshair) p.crosshair.setAttribute("visibility", "hidden"); });
-  }
-  function resetView() { state.viewDomain = state.fullDomain.slice(); dismissPinned(); renderAll(); }
-
-  function niceTicks(min, max, count) {
-    if (min === max) { min -= 1; max += 1; }
-    var step0 = (max - min) / count;
-    var mag = Math.pow(10, Math.floor(Math.log10(step0)));
-    var residual = step0 / mag;
-    var step = residual > 5 ? 10 * mag : residual > 2 ? 5 * mag : residual > 1 ? 2 * mag : mag;
-    var ticks = [];
-    for (var v = Math.floor(min / step) * step; v <= Math.ceil(max / step) * step + 1e-9; v += step) ticks.push(Math.round(v * 1000) / 1000);
-    return ticks;
-  }
-
-  function timeTicks(domain, innerW) {
-    var span = domain[1] - domain[0];
-    var maxTicks = Math.max(2, Math.floor(innerW / MIN_PX_PER_TICK));
-    var step = STEP_CANDIDATES_MS[STEP_CANDIDATES_MS.length - 1];
-    for (var i = 0; i < STEP_CANDIDATES_MS.length; i++) {
-      if (span / STEP_CANDIDATES_MS[i] <= maxTicks) { step = STEP_CANDIDATES_MS[i]; break; }
-    }
-    var ticks = [];
-    for (var t = Math.ceil(domain[0] / step) * step; t <= domain[1]; t += step) ticks.push(t);
-    return ticks;
-  }
-
-  function scaleLinear(domain, range) {
-    var span = domain[1] - domain[0] || 1;
-    return function (v) { return range[0] + ((v - domain[0]) / span) * (range[1] - range[0]); };
-  }
-  function svgEl(tag, attrs) {
-    var el = document.createElementNS("http://www.w3.org/2000/svg", tag);
-    for (var k in attrs) el.setAttribute(k, attrs[k]);
-    return el;
-  }
-
-  function linePath(vals, x, y) {
-    var d = "", pen = false;
-    for (var i = 0; i < vals.length; i++) {
-      if (vals[i] == null) { pen = false; continue; }
-      d += (pen ? "L" : "M") + x(tms[i]).toFixed(1) + "," + y(vals[i]).toFixed(1) + " ";
-      pen = true;
-    }
-    return d;
-  }
-  // Direction points are drawn as zero-length round-capped segments: one
-  // <path> per series instead of hundreds of <circle> nodes.
-  function dotPath(vals, x, y, lo, hi) {
-    var d = "";
-    for (var i = lo; i <= hi; i++) {
-      if (vals[i] == null) continue;
-      d += "M" + x(tms[i]).toFixed(1) + "," + y(vals[i]).toFixed(1) + "h0";
-    }
-    return d;
-  }
-
-  function visibleRange() {
-    var lo = 0, hi = tms.length - 1;
-    while (lo < tms.length && tms[lo] < state.viewDomain[0]) lo++;
-    while (hi >= 0 && tms[hi] > state.viewDomain[1]) hi--;
-    return [Math.max(0, lo - 1), Math.min(tms.length - 1, hi + 1)];
-  }
-
-  function speedYDomain() {
-    var r = visibleRange(), max = 0;
-    allSeries.forEach(function (s) {
-      if (!s.on) return;
-      for (var i = r[0]; i <= r[1]; i++) if (s.sp[i] != null && s.sp[i] > max) max = s.sp[i];
-    });
-    var ticks = niceTicks(0, Math.max(max * 1.05, 5), 4);
-    return [0, ticks[ticks.length - 1]];
-  }
-
-  function panelInnerH(isDir) { return (isDir ? H_DIR : H_SPEED) - MARGIN.top - MARGIN.bottom - (isDir ? BOTTOM_AXIS_H : 0); }
-
-  function buildPanel(id, isDir) {
-    var svg = document.getElementById(id);
-    var g = svgEl("g");
-    var clipRect = svgEl("rect");
-    var clipPath = svgEl("clipPath", { id: id + "-clip" });
-    var defs = svgEl("defs");
-    clipPath.appendChild(clipRect); defs.appendChild(clipPath);
-    svg.appendChild(g); svg.appendChild(defs);
-    var gridGroup = svgEl("g");
-    var plot = svgEl("g", { "clip-path": "url(#" + id + "-clip)" });
-    var chromeGroup = svgEl("g");
-    g.appendChild(gridGroup); g.appendChild(plot); g.appendChild(chromeGroup);
-    var panel = { svg: svg, g: g, gridGroup: gridGroup, plot: plot, chromeGroup: chromeGroup, clipRect: clipRect, isDir: isDir };
-    state.panels.push(panel);
-    attachInteraction(panel);
-  }
-
-  function renderAll() { state.panels.forEach(renderPanel); }
-
-  function renderPanel(panel) {
-    var W = state.width, H = panel.isDir ? H_DIR : H_SPEED;
-    var innerW = W - MARGIN.left - MARGIN.right, innerH = panelInnerH(panel.isDir);
-    panel.svg.setAttribute("viewBox", "0 0 " + W + " " + H);
-    panel.svg.setAttribute("width", W);
-    panel.svg.setAttribute("height", H);
-    panel.g.setAttribute("transform", "translate(" + MARGIN.left + "," + MARGIN.top + ")");
-    panel.clipRect.setAttribute("x", -2); panel.clipRect.setAttribute("y", -4);
-    panel.clipRect.setAttribute("width", innerW + 4); panel.clipRect.setAttribute("height", innerH + 8);
-    panel.gridGroup.innerHTML = ""; panel.plot.innerHTML = ""; panel.chromeGroup.innerHTML = "";
-
-    var x = scaleLinear(state.viewDomain, [0, innerW]);
-    var yDomain = panel.isDir ? [0, 360] : speedYDomain();
-    var y = scaleLinear(yDomain, [innerH, 0]);
-    panel.x = x; panel.y = y; panel.innerW = innerW; panel.innerH = innerH;
-
-    var yTicks = panel.isDir ? [0, 90, 180, 270, 360] : niceTicks(yDomain[0], yDomain[1], 4);
-    var dirLabels = { 0: "N", 90: "E", 180: "S", 270: "W", 360: "N" };
-    yTicks.forEach(function (t) {
-      panel.gridGroup.appendChild(svgEl("line", { x1: 0, x2: innerW, y1: y(t), y2: y(t), stroke: "var(--grid)", "stroke-width": 1 }));
-      var lbl = svgEl("text", { class: "axis-label", x: -6, y: y(t) + 3, "text-anchor": "end" });
-      lbl.textContent = panel.isDir ? dirLabels[t] + " " + t + "°" : Math.round(t);
-      panel.chromeGroup.appendChild(lbl);
-    });
-
-    timeTicks(state.viewDomain, innerW).forEach(function (t) {
-      var xp = x(t);
-      panel.gridGroup.appendChild(svgEl("line", { x1: xp, x2: xp, y1: 0, y2: innerH, stroke: "var(--grid)", "stroke-width": 1 }));
-      if (panel.isDir) {
-        panel.chromeGroup.appendChild(svgEl("line", { x1: xp, x2: xp, y1: innerH, y2: innerH + 4, stroke: "var(--faint)", "stroke-width": 1 }));
-        var midnight = fmtHM(t) === "00:00";
-        var lbl = svgEl("text", { class: "axis-label", x: xp, y: innerH + 15, "text-anchor": "middle" });
-        lbl.textContent = fmtHM(t);
-        panel.chromeGroup.appendChild(lbl);
-        if (midnight) {
-          var d = svgEl("text", { class: "axis-label", x: xp, y: innerH + 26, "text-anchor": "middle" });
-          d.textContent = fmtDay(t);
-          panel.chromeGroup.appendChild(d);
-        }
-      }
-    });
-
-    if (state.hourBand) {
-      var bx0 = x(state.hourBand[0]), bx1 = x(state.hourBand[1]);
-      panel.plot.appendChild(svgEl("rect", { class: "band", x: Math.min(bx0, bx1), y: 0,
-        width: Math.abs(bx1 - bx0), height: innerH }));
-    }
-    var r = visibleRange();
-    // Stations first, region averages on top.
-    allSeries.forEach(function (s) {
-      if (!s.on) return;
-      if (panel.isDir) {
-        panel.plot.appendChild(svgEl("path", {
-          d: dotPath(s.dr, x, y, r[0], r[1]), fill: "none", stroke: s.color,
-          "stroke-width": s.isAvg ? 7 : 4, "stroke-linecap": "round", opacity: s.isAvg ? 1 : 0.8
-        }));
-      } else {
-        panel.plot.appendChild(svgEl("path", {
-          d: linePath(s.sp, x, y), fill: "none", stroke: s.color,
-          "stroke-width": s.isAvg ? 3.5 : 1.4, "stroke-linejoin": "round", "stroke-linecap": "round",
-          opacity: s.isAvg ? 1 : 0.85
-        }));
-      }
-    });
-
-    var crosshair = svgEl("line", { x1: -10, x2: -10, y1: 0, y2: innerH, stroke: "var(--faint)", "stroke-width": 1, visibility: "hidden" });
-    panel.chromeGroup.appendChild(crosshair);
-    panel.crosshair = crosshair;
-  }
-
-  function clampViewDomain(domain) {
-    var full = state.fullDomain;
-    var span = Math.max(Math.min(domain[1] - domain[0], full[1] - full[0]), MIN_SPAN_MS);
-    var lo = domain[0], hi = lo + span;
-    if (lo < full[0]) { lo = full[0]; hi = lo + span; }
-    if (hi > full[1]) { hi = full[1]; lo = hi - span; }
-    return [lo, hi];
-  }
-  function localXFromClientX(svg, clientX) {
-    var rect = svg.getBoundingClientRect();
-    return (clientX - rect.left) * (state.width / rect.width) - MARGIN.left;
-  }
-  function localYFromClientY(svg, clientY) {
-    var rect = svg.getBoundingClientRect();
-    return (clientY - rect.top) * (state.width / rect.width) - MARGIN.top;
-  }
-  function zoomAtFrac(frac, factor) {
-    frac = Math.max(0, Math.min(1, frac));
-    var d = state.viewDomain, cursorT = d[0] + frac * (d[1] - d[0]), span = (d[1] - d[0]) * factor;
-    state.viewDomain = clampViewDomain([cursorT - frac * span, cursorT - frac * span + span]);
-    renderAll();
-  }
-  function zoomBy(f) { zoomAtFrac(0.5, f); }
-
-  // Single pointer = pan. Two pointers = pinch-zoom around their midpoint.
-  function attachInteraction(panel) {
-    var svg = panel.svg, pointers = {}, dragState = null, pinchState = null;
-    var activeIds = function () { return Object.keys(pointers); };
-    var dist = function (a, b) { return Math.hypot(pointers[a].x - pointers[b].x, pointers[a].y - pointers[b].y); };
-
-    svg.addEventListener("pointerdown", function (evt) {
-      evt.preventDefault();
-      try { svg.setPointerCapture(evt.pointerId); } catch (e) {}
-      pointers[evt.pointerId] = { x: evt.clientX, y: evt.clientY };
-      var a = activeIds();
-      if (a.length === 2) {
-        dragState = null; pinchState = { ids: a, lastDist: dist(a[0], a[1]) };
-        svg.classList.remove("dragging"); panel.tapStart = null;
-      } else if (a.length === 1) {
-        pinchState = null; svg.classList.add("dragging");
-        dragState = { startX: evt.clientX, startDomain: state.viewDomain.slice() };
-        panel.tapStart = { x: evt.clientX, y: evt.clientY };
-      }
-    });
-
-    svg.addEventListener("pointermove", function (evt) {
-      if (!(evt.pointerId in pointers)) { handleHover(panel, evt); return; }
-      pointers[evt.pointerId] = { x: evt.clientX, y: evt.clientY };
-      if (panel.tapStart && Math.hypot(evt.clientX - panel.tapStart.x, evt.clientY - panel.tapStart.y) > TAP_MAX_MOVE_PX) panel.tapStart = null;
-
-      if (pinchState) {
-        evt.preventDefault();
-        var p = pinchState.ids;
-        if (!(p[0] in pointers) || !(p[1] in pointers)) return;
-        var d = dist(p[0], p[1]);
-        if (pinchState.lastDist > 0 && d > 0) {
-          var mid = (pointers[p[0]].x + pointers[p[1]].x) / 2;
-          zoomAtFrac(localXFromClientX(svg, mid) / panel.innerW, pinchState.lastDist / d);
-        }
-        pinchState.lastDist = d;
-        return;
-      }
-      if (dragState) {
-        evt.preventDefault();
-        var scale = state.width / svg.getBoundingClientRect().width;
-        var dtMs = ((evt.clientX - dragState.startX) * scale) / (panel.innerW / (dragState.startDomain[1] - dragState.startDomain[0]));
-        state.viewDomain = clampViewDomain([dragState.startDomain[0] - dtMs, dragState.startDomain[1] - dtMs]);
-        renderAll();
-        return;
-      }
-      handleHover(panel, evt);
-    });
-
-    function endPointer(evt) {
-      try { svg.releasePointerCapture(evt.pointerId); } catch (e) {}
-      delete pointers[evt.pointerId];
-      var a = activeIds();
-      var wasTap = evt.type === "pointerup" && !pinchState && panel.tapStart && a.length === 0;
-      if (pinchState) {
-        if (a.length < 2) {
-          pinchState = null;
-          if (a.length === 1) { dragState = { startX: pointers[a[0]].x, startDomain: state.viewDomain.slice() }; svg.classList.add("dragging"); }
-          else svg.classList.remove("dragging");
-        }
-      } else if (dragState && a.length === 0) { dragState = null; svg.classList.remove("dragging"); }
-      if (wasTap) {
-        panel.tapStart = null; state.pinned = true; showReadings(panel, evt);
-        var fr = Math.max(0, Math.min(1, localXFromClientX(svg, evt.clientX) / panel.innerW));
-        window.dispatchEvent(new CustomEvent("charttime", { detail: { ms: state.viewDomain[0] + fr * (state.viewDomain[1] - state.viewDomain[0]) } }));
-      }
-    }
-    svg.addEventListener("pointerup", endPointer);
-    svg.addEventListener("pointercancel", endPointer);
-    svg.addEventListener("pointerleave", function () {
-      if (state.pinned) return;
-      state.panels.forEach(function (p) { if (p.crosshair) p.crosshair.setAttribute("visibility", "hidden"); });
-      els.tooltip.hidden = true;
-    });
-    svg.addEventListener("wheel", function (evt) {
-      evt.preventDefault();
-      zoomAtFrac(localXFromClientX(svg, evt.clientX) / panel.innerW, evt.deltaY > 0 ? 1.15 : 1 / 1.15);
-    }, { passive: false });
-  }
-
-  function handleHover(panel, evt) { if (!state.pinned) showReadings(panel, evt); }
-
-  function showReadings(panel, evt) {
-    var lx = Math.max(0, Math.min(panel.innerW, localXFromClientX(panel.svg, evt.clientX)));
-    var d = state.viewDomain, tMs = d[0] + (lx / panel.innerW) * (d[1] - d[0]);
-    var idx = 0, best = Infinity;
-    for (var i = 0; i < tms.length; i++) { var diff = Math.abs(tms[i] - tMs); if (diff < best) { best = diff; idx = i; } }
-
-    state.panels.forEach(function (p) {
-      if (!p.crosshair) return;
-      var cx = p.x(tms[idx]);
-      p.crosshair.setAttribute("x1", cx); p.crosshair.setAttribute("x2", cx);
-      p.crosshair.setAttribute("visibility", "visible");
-    });
-
-    var tip = els.tooltip;
-    tip.innerHTML = "";
-    function row(label, color, value, bold) {
-      var r = document.createElement("div"); r.className = "row";
-      var k = document.createElement("span"); k.className = "k"; k.textContent = label;
-      if (color) k.style.color = color;
-      var v = document.createElement("span"); v.className = "v"; v.textContent = value;
-      r.appendChild(k); r.appendChild(v); tip.appendChild(r);
-    }
-    row("Time", null, fmtDay(tms[idx]) + " " + fmtHM(tms[idx]) + " SGT");
-    var any = false;
-    function reading(s) {
-      var sp = s.sp[idx], dr = s.dr[idx];
-      return (sp == null ? "–" : sp.toFixed(1) + " km/h") + " · " + (dr == null ? "–" : compass(dr) + " " + dr + "°");
-    }
-    averages.forEach(function (s) {
-      if (!s.on) return;
-      any = true; row(s.region + " avg", s.color, reading(s));
-    });
-
-    // Many stations would make the tooltip huge: show just the one whose
-    // line/dot is closest to the pointer in the hovered panel.
-    var ly = localYFromClientY(panel.svg, evt.clientY), near = null, nearD = 24;
-    stations.forEach(function (s) {
-      var v = panel.isDir ? s.dr[idx] : s.sp[idx];
-      if (!s.on || v == null) return;
-      var dy = Math.abs(panel.y(v) - ly);
-      if (dy < nearD) { nearD = dy; near = s; }
-    });
-    if (near) {
-      if (any) { var sep = document.createElement("div"); sep.className = "sep"; tip.appendChild(sep); }
-      any = true; row(near.name + " (" + near.region + ")", near.color, reading(near));
-    }
-    if (!any) { tip.hidden = true; return; }
-
-    tip.hidden = false;
-    var w = tip.offsetWidth || 220, left = evt.clientX + 14;
-    if (left + w > window.innerWidth) left = Math.max(4, evt.clientX - w - 14);
-    tip.style.left = left + "px";
-    tip.style.top = (evt.clientY + 14) + "px";
-  }
-
-  function buildChips() {
-    var chips = document.getElementById("chips");
-    function setAll(v) { allSeries.forEach(function (s) { s.on = v; }); refreshChips(); renderAll(); }
-    document.getElementById("all").onclick = function () { setAll(true); };
-    document.getElementById("none").onclick = function () { setAll(false); };
-
-    function chip(s) {
-      var b = document.createElement("button");
-      b.type = "button"; b.className = "chip" + (s.isAvg ? " avg" : "");
-      var dot = document.createElement("i"); dot.style.background = s.color;
-      var label = document.createElement("span");
-      label.textContent = s.isAvg ? s.region : s.name;
-      b.appendChild(dot); b.appendChild(label);
-      b.onclick = function () { s.on = !s.on; refreshChips(); renderAll(); };
-      s.chip = b;
-      return b;
-    }
-    if (averages.length) {
-      var ag = document.createElement("div"); ag.className = "group";
-      var ahead = document.createElement("div"); ahead.className = "ghead";
-      var ah3 = document.createElement("h3"); ah3.textContent = "Region averages (vector mean)";
-      function setAvg(v) { averages.forEach(function (s) { s.on = v; }); refreshChips(); renderAll(); }
-      var aAll = document.createElement("button"); aAll.type = "button"; aAll.textContent = "All";
-      aAll.onclick = function () { setAvg(true); };
-      var aNone = document.createElement("button"); aNone.type = "button"; aNone.textContent = "None";
-      aNone.onclick = function () { setAvg(false); };
-      ahead.appendChild(ah3); ahead.appendChild(aAll); ahead.appendChild(aNone);
-      var agrid = document.createElement("div"); agrid.className = "chips";
-      averages.forEach(function (s) { agrid.appendChild(chip(s)); });
-      ag.appendChild(ahead); ag.appendChild(agrid); chips.appendChild(ag);
-    }
-    STORE.regions.forEach(function (region) {
-      var members = stations.filter(function (s) { return s.region === region; });
-      if (!members.length) return;
-      var avg = averages.filter(function (s) { return s.region === region; })[0];
-      var g = document.createElement("div"); g.className = "group";
-      var head = document.createElement("div"); head.className = "ghead";
-      var h3 = document.createElement("h3");
-      h3.textContent = region + " (" + members.length + ")";
-      var only = document.createElement("button"); only.type = "button"; only.textContent = "Only";
-      only.onclick = function () {
-        allSeries.forEach(function (s) { s.on = false; });
-        members.forEach(function (s) { s.on = true; }); avg.on = true;
-        refreshChips(); renderAll();
-      };
-      var tog = document.createElement("button"); tog.type = "button"; tog.textContent = "Toggle";
-      tog.onclick = function () {
-        var all = members.every(function (s) { return s.on; });
-        members.forEach(function (s) { s.on = !all; }); refreshChips(); renderAll();
-      };
-      head.appendChild(h3); head.appendChild(only); head.appendChild(tog);
-      var grid = document.createElement("div"); grid.className = "chips";
-      members.forEach(function (s) { grid.appendChild(chip(s)); });
-      g.appendChild(head); g.appendChild(grid); chips.appendChild(g);
-    });
-  }
-  function refreshChips() { allSeries.forEach(function (s) { if (s.chip) s.chip.classList.toggle("off", !s.on); }); }
-})();
-</script>
-<script>
-(function () {
-  "use strict";
-  var CONV = __CONV__;
-  var $ = function (id) { return document.getElementById(id); };
-  var COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
-
-  // ── Tabs ────────────────────────────────────────────────────────────────
-  var views = { ts: $("view-ts"), map: $("view-map") }, tabs = { ts: $("tab-ts"), map: $("tab-map") };
-  function showTab(name, fromHash) {
-    Object.keys(views).forEach(function (k) {
-      views[k].classList.toggle("is-off", k !== name);
-      tabs[k].setAttribute("aria-selected", k === name ? "true" : "false");
-    });
-    if (!fromHash) { try { history.replaceState(null, "", name === "map" ? "#map" : location.pathname + location.search); } catch (e) {} }
-    window.dispatchEvent(new CustomEvent("tabshown", { detail: name }));
-  }
-  tabs.ts.onclick = function () { showTab("ts"); };
-  tabs.map.onclick = function () { showTab("map"); };
-  if (location.hash === "#map") showTab("map", true);
-
-  if (!CONV || !CONV.hours || !CONV.hours.length) {
-    $("mapBody").hidden = true; $("mapEmpty").hidden = false;
-    $("mapTitle").textContent = "Wind convergence";
-    return;
-  }
-
-  // ── Data ────────────────────────────────────────────────────────────────
-  function decode(s) {
-    var bin = atob(s), a = new Int8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) a[i] = (bin.charCodeAt(i) << 24) >> 24;
-    return a;
-  }
-  var G = CONV.grid, NC = G.nx * G.ny, NH = CONV.hours.length, NODATA = CONV.nodata, SC = CONV.scale;
-  var L = { mean: decode(CONV.mean), peak: decode(CONV.peak), pos: decode(CONV.pos), sig: decode(CONV.sig),
-            base: decode(CONV.base), conf: decode(CONV.conf) };
-  var hourMs = CONV.hours.map(function (h) { return Date.parse(h.t + ":00Z"); });   // SGT wall-clock as UTC
-  var HOUR = 3600000;
-  function fmt(ms, o) { return new Intl.DateTimeFormat("en-GB", Object.assign({ timeZone: "UTC" }, o)).format(new Date(ms)); }
-  var fmtHM = function (ms) { return fmt(ms, { hour: "2-digit", minute: "2-digit", hour12: false }); };
-  var fmtDay = function (ms) { return fmt(ms, { weekday: "short", day: "numeric", month: "short" }); };
-
-  // Map extent (degrees) and projection with a km-true aspect ratio.
-  var EXT = { lon0: 103.59, lon1: 104.10, lat0: 1.17, lat1: 1.48 };
-  var ASPECT = ((EXT.lon1 - EXT.lon0) * 111.29) / ((EXT.lat1 - EXT.lat0) * 110.57);
-  var KMLON = 111.29, KMLAT = 110.57;
-
-  // ── Colours ─────────────────────────────────────────────────────────────
-  var RAMP = [[-1, [26, 79, 156]], [-0.66, [58, 134, 205]], [-0.33, [150, 197, 232]], [0, [242, 242, 240]],
-              [0.33, [246, 176, 138]], [0.66, [226, 92, 62]], [1, [165, 15, 38]]];
-  function rampColor(t) {
-    t = Math.max(-1, Math.min(1, t));
-    for (var i = 1; i < RAMP.length; i++) {
-      if (t <= RAMP[i][0]) {
-        var a = RAMP[i - 1], b = RAMP[i], f = (t - a[0]) / (b[0] - a[0]);
-        return [0, 1, 2].map(function (k) { return Math.round(a[1][k] + f * (b[1][k] - a[1][k])); });
-      }
-    }
-    return RAMP[RAMP.length - 1][1];
-  }
-  // Scales sit near the 90th percentile of real values (mean 13, peak 17, persistence 9) so typical features are clearly coloured.
-  var SCALE_MAX = { mean: 12, meanBase: 20, peak: 18, pers: 8 };
-
-  // ── State ───────────────────────────────────────────────────────────────
-  var S = { h: NH - 1, layer: "mean", win: 3, base: false, arrows: true, stations: true, tap: null, timer: null };
-  var canvas = $("mapCanvas"), ctx = canvas.getContext("2d"), off = document.createElement("canvas");
-  off.width = G.nx; off.height = G.ny;
-  var cssv = function (n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); };
-  var W = 0, H = 0;
-  function X(lon) { return (lon - EXT.lon0) / (EXT.lon1 - EXT.lon0) * W; }
-  function Y(lat) { return (EXT.lat1 - lat) / (EXT.lat1 - EXT.lat0) * H; }
-  function lonAt(px) { return EXT.lon0 + px / W * (EXT.lon1 - EXT.lon0); }
-  function latAt(py) { return EXT.lat1 - py / H * (EXT.lat1 - EXT.lat0); }
-
-  function at(arr, h, k) { var v = arr[h * NC + k]; return v === NODATA ? null : v / SC; }
-  function scaleMax() { return S.layer === "mean" ? (S.base ? SCALE_MAX.meanBase : SCALE_MAX.mean) : SCALE_MAX[S.layer]; }
-
-  function fieldValue(k) {
-    var h = S.h, v, i;
-    if (S.layer === "pers") {
-      var lo = Math.max(0, h - S.win + 1), sum = 0, n = 0;
-      for (i = lo; i <= h; i++) { v = at(L.pos, i, k); if (v != null) { sum += v; n++; } }
-      return n ? sum / n : null;
-    }
-    v = at(S.layer === "peak" ? L.peak : L.mean, h, k);
-    if (v != null && S.layer === "mean" && S.base) { var b = L.base[k]; if (b !== NODATA) v += b / SC; }
-    return v;
-  }
-  function sigmaValue(k) { var v = L.sig[S.h * NC + k]; return v === NODATA ? null : v / 4; }
-  function confAt(k) { return L.conf[k] / 1; }   // 0 none, 1 faded, 2 solid
-
-  // ── Drawing ─────────────────────────────────────────────────────────────
-  function paintField() {
-    var octx = off.getContext("2d"), img = octx.createImageData(G.nx, G.ny), mx = scaleMax(), pers = S.layer === "pers";
-    for (var k = 0; k < NC; k++) {
-      var v = fieldValue(k), c = confAt(k), row = G.ny - 1 - Math.floor(k / G.nx), col = k % G.nx, o = (row * G.nx + col) * 4;
-      if (v == null || c === 0) { img.data[o + 3] = 0; continue; }
-      var t = v / mx, rgb = rampColor(pers ? Math.max(0, t) : t);   // persistence: white -> red only
-      var g = Math.sign(t) * Math.pow(Math.min(1, Math.abs(t)), 0.8);    // mild contrast boost for weak values
-      rgb = rampColor(pers ? Math.max(0, g) : g);
-      var a = 0.3 + 0.7 * Math.min(1, Math.abs(t) * 2.2);
-      img.data[o] = rgb[0]; img.data[o + 1] = rgb[1]; img.data[o + 2] = rgb[2];
-      img.data[o + 3] = Math.round(255 * a * (c >= 2 ? 1 : 0.65));
-    }
-    octx.putImageData(img, 0, 0);
-  }
-
-  function arrow(x, y, dx, dy, color) {
-    var len = Math.hypot(dx, dy); if (len < 1) return;
-    var ux = dx / len, uy = dy / len, hx = x + dx, hy = y + dy, hs = Math.min(6, 3 + len / 6);
-    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(hx, hy); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(hx, hy);
-    ctx.lineTo(hx - ux * hs - uy * hs * 0.6, hy - uy * hs + ux * hs * 0.6);
-    ctx.lineTo(hx - ux * hs + uy * hs * 0.6, hy - uy * hs - ux * hs * 0.6);
-    ctx.closePath(); ctx.fillStyle = color; ctx.fill();
-  }
-
-  function draw() {
-    W = $("mapWrap").clientWidth; if (W < 50) return;
-    H = Math.round(W / ASPECT);
-    var dpr = window.devicePixelRatio || 1;
-    canvas.style.height = H + "px"; canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = cssv("--bg") || "#f9f9f7"; ctx.fillRect(0, 0, W, H);
-
-    // land
-    function ring(r) { r.forEach(function (p, i) { if (i) ctx.lineTo(X(p[0]), Y(p[1])); else ctx.moveTo(X(p[0]), Y(p[1])); }); ctx.closePath(); }
-    ctx.beginPath(); (CONV.coast || []).forEach(ring);
-    ctx.fillStyle = cssv("--grid") || "#e1e0d9"; ctx.fill();
-
-    // convergence field (smoothly upscaled)
-    paintField();
-    var lonL = G.lon0 - G.dlon / 2, lonR = lonL + G.nx * G.dlon, latB = G.lat0 - G.dlat / 2, latT = latB + G.ny * G.dlat;
-    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(off, X(lonL), Y(latT), X(lonR) - X(lonL), Y(latB) - Y(latT));
-
-    // coast
-    ctx.beginPath(); (CONV.coast || []).forEach(ring);
-    ctx.strokeStyle = cssv("--faint") || "#898781"; ctx.lineWidth = 1; ctx.stroke();
-
-    var ink = cssv("--ink") || "#0b0b0b", pxPerKmh = (W / 360) * 1.5;
-    if (S.arrows) {
-      ctx.strokeStyle = ink; ctx.lineWidth = 1.6; ctx.lineCap = "round";
-      CONV.stations.forEach(function (st) {
-        var w = CONV.wind[st.id] && CONV.wind[st.id][S.h]; if (!w) return;
-        var len = Math.min(Math.hypot(w[0], w[1]) * pxPerKmh, W * 0.1), sp = Math.hypot(w[0], w[1]) || 1;
-        arrow(X(st.lon), Y(st.lat), w[0] / sp * len, -w[1] / sp * len, ink);
-      });
-    }
-    if (S.stations || S.arrows) {
-      CONV.stations.forEach(function (st) {
-        ctx.beginPath(); ctx.arc(X(st.lon), Y(st.lat), 2.6, 0, 6.2832);
-        ctx.fillStyle = cssv("--bg") || "#fff"; ctx.fill(); ctx.lineWidth = 1.4; ctx.strokeStyle = ink; ctx.stroke();
-      });
-    }
-    if (S.tap) {
-      ctx.beginPath(); ctx.arc(X(S.tap.lon), Y(S.tap.lat), 7, 0, 6.2832);
-      ctx.lineWidth = 2; ctx.strokeStyle = ink; ctx.stroke();
-    }
-  }
-
-  // ── Legend / labels ─────────────────────────────────────────────────────
-  var LAYER_NAME = { mean: "Hourly mean convergence", peak: "Hourly peak convergence", pers: "Persistent convergence" };
-  function labels() {
-    var h = CONV.hours[S.h], t = hourMs[S.h], mx = scaleMax(), pers = S.layer === "pers";
-    var span = fmtHM(t) + "–" + fmtHM(t + HOUR);
-    $("mapTitle").textContent = LAYER_NAME[S.layer] + (S.layer === "pers" ? ", last " + Math.min(S.win, S.h + 1) + " h" : "");
-    $("mapSub").textContent = fmtDay(t) + " " + span + " SGT · " + h.n + "/12 steps" + (h.n < 12 ? " (partial hour)" : "") +
-      " · " + h.stn + " stations";
-    var stops = pers ? [0, 0.5, 1] : [-1, -0.5, 0, 0.5, 1];
-    $("legBar").style.background = "linear-gradient(to right," + stops.map(function (v) {
-      var c = rampColor(v); return "rgb(" + c.join(",") + ")"; }).join(",") + ")";
-    var lab = pers ? [0, mx / 2, mx] : [-mx, 0, mx];
-    $("legTicks").innerHTML = lab.map(function (v, i) { return "<span>" + (v > 0 && !pers ? "+" : "") + Math.round(v * 10) / 10 + (i === lab.length - 1 && !pers ? "+" : "") + "</span>"; }).join("");
-    $("legCap").textContent = pers
-      ? "Average convergent part of the wind anomaly, ×10⁻⁵ s⁻¹ (red = persistent convergence)"
-      : "Wind-anomaly convergence, ×10⁻⁵ s⁻¹ (red = converging, blue = diverging)";
-    $("hSlider").value = S.h; $("hSlider").max = NH - 1;
-    $("hPrev").disabled = S.h === 0; $("hNext").disabled = S.h === NH - 1;
-    $("winSeg").hidden = !pers; $("optBaseWrap").hidden = S.layer !== "mean";
-    $("hPlay").textContent = S.timer ? "Pause" : "Play";
-  }
-
-  function nearest(lon, lat) {
-    var best = null, bd = 1e9;
-    CONV.stations.forEach(function (st) {
-      var d = Math.hypot((st.lon - lon) * KMLON, (st.lat - lat) * KMLAT);
-      if (d < bd) { bd = d; best = st; }
-    });
-    return { st: best, km: bd };
-  }
-  function info() {
-    var el = $("mapInfo");
-    if (!S.tap) { el.textContent = "Tap the map for values at a point."; return; }
-    var gx = Math.round((S.tap.lon - G.lon0) / G.dlon), gy = Math.round((S.tap.lat - G.lat0) / G.dlat), txt;
-    var near = nearest(S.tap.lon, S.tap.lat), w = CONV.wind[near.st.id] && CONV.wind[near.st.id][S.h];
-    if (gx < 0 || gy < 0 || gx >= G.nx || gy >= G.ny) { txt = "Outside the analysed area."; }
-    else {
-      var k = gy * G.nx + gx, v = fieldValue(k), c = confAt(k);
-      if (v == null || c === 0) txt = "Too far from any station (over " + CONV.params.mask_km + " km) to estimate convergence here.";
-      else {
-        var sg = S.layer === "mean" ? sigmaValue(k) : null;
-        txt = "<strong>" + (v >= 0 ? "+" : "") + v.toFixed(1) + "</strong> ×10⁻⁵ s⁻¹ " + (v >= 0 ? "convergence" : "divergence") +
-          (sg != null ? " (±" + sg.toFixed(1) + (Math.abs(v) < 2 * sg ? ", within noise" : "") + ")" : "") +
-          (c < 2 ? " · low confidence, far from stations" : "");
-      }
-    }
-    if (w) {
-      var sp = Math.hypot(w[0], w[1]), dir = (Math.atan2(-w[0], -w[1]) * 180 / Math.PI + 360) % 360;
-      txt += "<br>Nearest station: " + near.st.name + " (" + near.km.toFixed(1) + " km), hourly wind " + sp.toFixed(1) + " km/h from " +
-        COMPASS[Math.round(dir / 22.5) % 16] + " " + Math.round(dir) + "°";
-    }
-    el.innerHTML = txt;
-  }
-
-  // ── Interaction ─────────────────────────────────────────────────────────
-  function render() { labels(); draw(); info(); }
-  function select(h, quiet) {
-    S.h = Math.max(0, Math.min(NH - 1, h)); render();
-    if (!quiet) window.dispatchEvent(new CustomEvent("hourselect", { detail: { start: hourMs[S.h], end: hourMs[S.h] + HOUR } }));
-  }
-  function stop() { if (S.timer) { clearInterval(S.timer); S.timer = null; } }
-  $("hSlider").oninput = function () { stop(); select(+this.value); };
-  $("hPrev").onclick = function () { stop(); select(S.h - 1); };
-  $("hNext").onclick = function () { stop(); select(S.h + 1); };
-  $("hLatest").onclick = function () { stop(); select(NH - 1); };
-  $("hPlay").onclick = function () {
-    if (S.timer) { stop(); labels(); return; }
-    if (S.h >= NH - 1) select(0);
-    S.timer = setInterval(function () { if (S.h >= NH - 1) { stop(); labels(); return; } select(S.h + 1); }, 900);
-    labels();
-  };
-  Array.prototype.forEach.call(document.querySelectorAll("#layerSeg button"), function (b) {
-    b.onclick = function () {
-      S.layer = b.dataset.layer;
-      Array.prototype.forEach.call(document.querySelectorAll("#layerSeg button"), function (x) { x.setAttribute("aria-pressed", x === b ? "true" : "false"); });
-      render();
-    };
-  });
-  Array.prototype.forEach.call(document.querySelectorAll("#winSeg button"), function (b) {
-    b.onclick = function () {
-      S.win = +b.dataset.win;
-      Array.prototype.forEach.call(document.querySelectorAll("#winSeg button"), function (x) { x.setAttribute("aria-pressed", x === b ? "true" : "false"); });
-      render();
-    };
-  });
-  $("optArrows").onchange = function () { S.arrows = this.checked; render(); };
-  $("optStn").onchange = function () { S.stations = this.checked; render(); };
-  $("optBase").onchange = function () { S.base = this.checked; render(); };
-
-  function tapAt(evt) {
-    var r = canvas.getBoundingClientRect();
-    S.tap = { lon: lonAt((evt.clientX - r.left) / r.width * W), lat: latAt((evt.clientY - r.top) / r.height * H) };
-    draw(); info();
-  }
-  canvas.addEventListener("pointerup", tapAt);
-  canvas.addEventListener("pointermove", function (e) { if (e.pointerType === "mouse") tapAt(e); });
-
-  // Time-series tap selects the matching hour.
-  window.addEventListener("charttime", function (e) {
-    for (var i = 0; i < NH; i++) {
-      if (e.detail.ms >= hourMs[i] && e.detail.ms < hourMs[i] + HOUR) { if (i !== S.h) { stop(); select(i); } return; }
-    }
-  });
-  window.addEventListener("tabshown", function (e) { if (e.detail === "map") render(); });
-  window.addEventListener("resize", function () { clearTimeout(S.rt); S.rt = setTimeout(draw, 120); });
-  if (window.ResizeObserver) new ResizeObserver(function () { clearTimeout(S.rt); S.rt = setTimeout(draw, 60); }).observe($("mapWrap"));
-
-  $("mapHint").innerHTML = "Convergence is how much the surface wind is piling up: red areas are where air converges (the usual trigger for sea-breeze fronts and showers, and where pollutants collect), blue where it spreads out. " +
-    "It is computed from each station's <em>change from its own 24 h average</em>, because station exposure differs and would otherwise create permanent false patterns; tick the box to add that fixed pattern back. " +
-    "With about 18 stations, only features larger than roughly 10 km are resolved, and cells far from any station are blank or faded.";
-  document.addEventListener("DOMContentLoaded", function () {
-    $("hSlider").max = NH - 1; render();
-    window.dispatchEvent(new CustomEvent("hourselect", { detail: { start: hourMs[S.h], end: hourMs[S.h] + HOUR } }));
-  });
-  if (document.readyState !== "loading") { $("hSlider").max = NH - 1; render(); }
-})();
+(function() {{
+  var stations = {map_data};
+  var map = L.map('leaflet-map', {{
+    center: [1.3521, 103.8198],
+    zoom: 11,
+    minZoom: 10,
+    maxZoom: 17,
+    scrollWheelZoom: true
+  }});
+
+  L.tileLayer('https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    subdomains: 'abcd',
+    maxZoom: 19
+  }}).addTo(map);
+
+  var convImage = {conv_image};
+  if (convImage) {{
+    L.imageOverlay(convImage, {conv_bounds}, {{opacity: 1, interactive: false}}).addTo(map);
+  }}
+
+  var maxSpd = 1;
+  stations.forEach(function(s) {{ if (s.mean_spd > maxSpd) maxSpd = s.mean_spd; }});
+
+  function speedColor(spd) {{
+    var t = spd / maxSpd;
+    var r = 255;
+    var g = Math.round(255 * (1 - t) * 0.7 + 69 * t);
+    var b = Math.round(160 * (1 - t));
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+  }}
+
+  stations.forEach(function(s) {{
+    var radius = 6 + (s.mean_spd / maxSpd) * 16;
+    L.circleMarker([s.lat, s.lon], {{
+      radius: radius,
+      fillColor: speedColor(s.mean_spd),
+      color: '#1f2328',
+      weight: 1,
+      fillOpacity: 0.85
+    }}).addTo(map).bindPopup(
+      '<b>' + s.name + '</b> (' + s.sid + ')<br>' +
+      'Mean: ' + s.mean_spd.toFixed(1) + ' km/h' +
+      (s.mean_dir !== null ? '<br>Dir: ' + Math.round(s.mean_dir) + '&deg;' : '')
+    );
+
+    if (s.mean_dir !== null) {{
+      // s.mean_dir is the met-bearing the wind blows FROM; the arrow should
+      // point the way the wind is blowing TOWARD, i.e. that bearing + 180.
+      var rot = s.mean_dir + 90;
+      var icon = L.divIcon({{
+        className: 'wind-arrow',
+        html: '<div style="transform:rotate(' + rot + 'deg)">&#10148;</div>',
+        iconSize: [20, 20],
+        iconAnchor: [10, 10]
+      }});
+      L.marker([s.lat, s.lon], {{icon: icon, interactive: false}}).addTo(map);
+    }}
+  }});
+}})();
 </script>
 </body>
 </html>
 """
 
 
-REGIONS = ["North", "West", "Central", "East", "South"]
-REGION_OVERRIDES = {
-    "S104": "North",
-    "S115": "West", "S117": "West", "S44": "West", "S23": "West", "S121": "West", "S50": "West",
-    "S111": "Central", "S109": "Central",
-    "S43": "East", "S06": "East", "S107": "East", "S106": "East",
-    "S116": "South", "S102": "South", "S60": "South", "S108": "South",
-}
-
-
-def region_of(sid, info):
-    if sid in REGION_OVERRIDES:
-        return REGION_OVERRIDES[sid]
-    lat, lon = info.get("lat", 0), info.get("lon", 0)
-    if lat > 1.42:  return "North"
-    if lon < 103.78: return "West"
-    if lon > 103.88: return "East"
-    if lat < 1.29:  return "South"
-    return "Central"
-
-
-def render(store):
-    DOCS.mkdir(exist_ok=True)
-    store = {**store, "stations": {sid: {**info, "region": region_of(sid, info)}
-                                   for sid, info in store["stations"].items()},
-             "regions": REGIONS}
-    payload = json.dumps(store, separators=(",", ":")).replace("</", "<\\/")
-    conv_json = "null"
-    try:
-        coast = json.loads(COAST_FILE.read_text()) if COAST_FILE.exists() else None
-        conv = convergence.compute(store, coast)
-        if conv:
-            conv_json = json.dumps(conv, separators=(",", ":")).replace("</", "<\\/")
-            print(f"  Convergence: {len(conv['hours'])} hourly fields, {len(conv_json)//1024} KB")
-        else:
-            print("  Convergence: not enough data, map left empty")
-    except Exception as e:                       # never let the map break the main page
-        print(f"  ⚠ convergence skipped: {e!r}")
-    html = HTML.replace("__DATA__", payload).replace("__CONV__", conv_json)
-    (DOCS / "index.html").write_text(html, encoding="utf-8")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    now = datetime.now(SGT).replace(tzinfo=None)
-    print(f"\n  SG Wind — now {now:{TS_FMT}} SGT, step {STEP_MINUTES} min, "
-          f"API key: {'yes' if API_KEY else 'no'}\n")
-    store = load_store()
-    update(store, now)
-    store["updated"] = now.strftime(TS_FMT)
-    save_store(store)
-    render(store)
-    print(f"\n  ✓ {len(store['readings'])} slots stored, site written to docs/index.html\n")
+    print(f"\n{'═'*60}")
+    print(f"  SG Wind Report Builder")
+    print(f"  Period: {PERIOD_LABEL}")
+    print(f"  API key: {'YES' if API_KEY else 'NO (unauthenticated)'}")
+    print(f"{'═'*60}\n")
+
+    timestamps, speed_ts, dir_ts, station_info, units = collect()
+    n_stations = len(speed_ts)
+    n_minutes  = len(timestamps)
+    print(f"\n  Collected {n_stations} stations × {n_minutes} minutes\n")
+
+    print("  Building charts …")
+    img_spag = chart_spaghetti(timestamps, speed_ts, station_info)
+    img_rank = chart_ranking(speed_ts, dir_ts, station_info)
+    map_stations = build_map_data(speed_ts, dir_ts, station_info)
+    map_data = json.dumps(map_stations).replace("</", "<\\/")
+    tbl_rows = build_table(speed_ts, dir_ts, station_info)
+
+    print("  Interpolating convergence field …")
+    convergence = build_convergence_field(speed_ts, dir_ts, station_info)
+    if convergence is not None:
+        conv_img_b64, conv_vmax = render_convergence_overlay(convergence)
+        conv_image  = json.dumps("data:image/png;base64," + conv_img_b64)
+        conv_bounds = json.dumps(CONV_BOUNDS)
+        conv_scale = f"""<div class="conv-scale">
+    <div class="conv-gradient"></div>
+    <div class="conv-scale-labels">
+      <span>&minus;{conv_vmax:.1f} divergence</span>
+      <span>0</span>
+      <span>+{conv_vmax:.1f} convergence</span>
+    </div>
+    <div class="conv-scale-caption">Wind convergence, &times;10&#8315;&#8308; s&#8315;&#185; (interpolated)</div>
+  </div>"""
+    else:
+        conv_image  = "null"
+        conv_bounds = "null"
+        conv_scale  = ""
+
+    html = HTML.format(
+        period_label   = PERIOD_LABEL,
+        n_stations     = n_stations,
+        n_minutes      = n_minutes,
+        map_data       = map_data,
+        conv_image     = conv_image,
+        conv_bounds    = conv_bounds,
+        conv_scale     = conv_scale,
+        img_spag       = img_spag,
+        img_rank       = img_rank,
+        table_rows     = tbl_rows,
+        speed_unit     = units["speed"] or "not reported by API",
+        direction_unit = units["direction"] or "not reported by API",
+        built          = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+    )
+
+    out = DOCS / "index.html"
+    out.write_text(html, encoding="utf-8")
+    print(f"\n  ✓ Site written to {out}  ({len(html)//1024} KB)\n")
 
 
 if __name__ == "__main__":
