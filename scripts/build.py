@@ -613,7 +613,8 @@ def render_convergence_overlay(convergence):
     # around every cell so the grid structure itself is clearly visible.
     ax.pcolormesh(glon, glat, convergence, cmap=cmap, norm=norm,
                   shading="nearest", alpha=0.65,
-                  edgecolors="#33415560", linewidth=0.6)
+                  edgecolors="#33415560", linewidth=0.6,
+                  antialiased=False)
     ax.set_xlim(CONV_LON_MIN, CONV_LON_MAX)
     ax.set_ylim(CONV_LAT_MIN, CONV_LAT_MAX)
     ax.set_aspect("auto")
